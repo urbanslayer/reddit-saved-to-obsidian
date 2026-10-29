@@ -101,16 +101,53 @@ over]*:
 Note: in a normal incremental sync an already-known *first* item still stops
 the run immediately — correct for an up-to-date vault.
 
+## Fill gaps
+
+If a sync was interrupted **before the resume cursor existed** (or the cursor
+was lost), Resume is not offered and Start stops at the first known item —
+the missing tail would be unreachable. Click **Fill gaps** on the sync page:
+it walks the whole saved listing from the top, skipping posts already in the
+vault (no detail fetch, no summary, no write for them), and adds any that are
+missing. It reuses the vault's `lastSyncId` (reported by the host's
+`getKnownIds`) as its sync id, so found items slot **below** the existing
+entries and your saved-order is preserved; with nothing known it starts a
+fresh id. The run is itself resumable: a 429 during Fill gaps stores a cursor
+with `skipKnown: true`, so Resume continues in the same mode. `maxItems`
+counts only newly collected items, so a vault already holding 200 entries
+with `maxItems 1000` can still gain 1000 new ones.
+
+## No duplicates
+
+Running the sync repeatedly — any mode, any number of times, even from two
+tabs — never writes the same saved item twice:
+
+- The host keys everything by Reddit fullname id (stripped/normalised);
+  duplicate ids inside one batch collapse, and a known id is updated in place
+  keeping its order key. Every `<!-- rs:ID -->` marker appears exactly once
+  per item across the notes.
+- If `.reddit-scraper/state.json` is lost or corrupt, the host **rebuilds it
+  from the rendered notes** before applying a write (corrupt files are backed
+  up as `state.json.corrupt-<timestamp>`); `getKnownIds` benefits too, so
+  existing entries are still recognised and not re-added.
+- Concurrent writers (two sync tabs / two browsers) serialise on an exclusive
+  `flock` file inside the folder (stdlib `fcntl`, safe no-op without it).
+- The scraper emits each id at most once per run, even if the listing shifts
+  during pagination and an item reappears on a later page (first rank kept).
+- Only one sync tab can run at a time: the running tab holds a heartbeat
+  flag in `storage.local` (stale after 2 min), and a second tab refuses to
+  start; the Start/Resume/Fill gaps buttons are disabled during a run.
+
 ## Layout
 
 - `manifest.base.json` → per-browser manifests via `scripts/build.mjs`
 - `src/parser.js` old.reddit HTML → items (tolerant; collects unparseable things as issues)
-- `src/scraper.js` async generator: pagination, politeness, incremental stop, enrichment, 429/5xx retry+backoff (shared `fetchResilient`), adaptive pacing, resume (`startUrl`/`startRank`/`skipKnown`)
+- `src/scraper.js` async generator: pagination, politeness, incremental stop, enrichment, 429/5xx retry+backoff (shared `fetchResilient`), adaptive pacing, resume (`startUrl`/`startRank`/`skipKnown`), per-run id dedupe
 - `src/summarize.js` local extractive summariser + optional AI with fallback
-- `src/native.js` native-messaging contract wrapper (ping/checkVault/getKnownIds/writeItems)
-- `src/resume.js` pure resume-cursor helpers (save/load/clear/match) over a storage adapter
+- `src/native.js` native-messaging contract wrapper (ping/checkVault/getKnownIds+lastSyncId/writeItems)
+- `src/resume.js` pure resume-cursor helpers (save/load/clear/match, fill-gaps syncId) over a storage adapter
+- `src/synclock.js` cross-tab single-run guard (heartbeat flag, stale after 2 min)
 - `src/settings.js` storage-backed settings with defaults
-- `test/` `node --test` + jsdom fixtures (synthetic old.reddit pages + a real login-wall capture); `rate-limit-resume.test.mjs` covers retry/backoff/pacing/resume with mocked fetch+sleep
+- `test/` `node --test` + jsdom fixtures (synthetic old.reddit pages + a real login-wall capture); `rate-limit-resume.test.mjs` covers retry/backoff/pacing/resume/fill-gaps/dedupe with mocked fetch+sleep, `synclock.test.mjs` the concurrency flag
 
 ## Known limitations
 

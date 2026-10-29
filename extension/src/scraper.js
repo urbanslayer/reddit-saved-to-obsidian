@@ -193,9 +193,13 @@ export function finalizeItems(items, { embedImages = true } = {}) {
  *   (default: the saved page). Pair with startRank/startPage.
  * @param {number} [opts.startRank] resume: global rank to start assigning (keeps ordering consistent)
  * @param {number} [opts.startPage] resume: number of pages already written (batch page numbers continue from it)
- * @param {boolean} [opts.skipKnown] resume mode: known ids are skipped (not
- *   re-fetched/summarised/written) but still consume a rank, and never stop
- *   the run. Without it, `incremental` means stop at the FIRST known id.
+ * @param {boolean} [opts.skipKnown] resume/fill-gaps mode: known ids are
+ *   skipped (not re-fetched/summarised/written) but still consume a rank, and
+ *   never stop the run. Without it, `incremental` means stop at the FIRST
+ *   known id.
+ *   Independent of mode, every id is emitted at most once per run: an item
+ *   that reappears on a later page (listing shift during pagination) keeps
+ *   its first rank and is never sent to the host twice.
  * @param {object} [opts.retry] overrides for RETRY_DEFAULTS (maxAttempts, baseBackoffMs, …)
  * @param {() => number} [opts.now] clock (tests)
  * @param {(data: object) => void} [opts.onRateLimited] called for every retryable failure before its wait
@@ -284,6 +288,7 @@ export async function* scrapeSaved(opts) {
   let page = Math.max(0, Math.floor(Number(startPage) || 0));
   let rank = Math.max(0, Math.floor(Number(startRank) || 0)); // global listing index (0 = newest)
   const allItems = [];
+  const collected = new Set(); // ids emitted by THIS run (never send one twice)
   let stopEarly = false;
   let first = true;
   let lastFetchAt = 0; // polite pacing across ALL detail fetches
@@ -350,7 +355,20 @@ export async function* scrapeSaved(opts) {
           continue;
         }
       }
+      if (collected.has(item.id)) {
+        // The listing shifted during pagination and this item reappeared at
+        // a new position. It was already emitted earlier this run with its
+        // first (lower) rank — emit it once, keep the first rank; the
+        // duplicate still consumes its new listing slot so later ranks stay
+        // aligned with the listing index.
+        onProgress(`skipping duplicate ${item.id} (reappeared at rank ${rank} after a listing shift); keeping its first rank`, {
+          type: "duplicate", id: item.id, rank,
+        });
+        rank += 1;
+        continue;
+      }
       item.rank = rank++;
+      collected.add(item.id);
       pageItems.push(item);
     }
 

@@ -10,6 +10,7 @@ import {
 } from "../src/scraper.js";
 import {
   CURSOR_KEY, makeCursor, saveCursor, loadCursor, clearCursor, cursorMatches, describeCursor,
+  fillGapsSyncId,
 } from "../src/resume.js";
 import { applyLocal } from "../src/summarize.js";
 
@@ -354,6 +355,84 @@ test("scrapeSaved: normal incremental stops immediately when the FIRST item is k
   assert.ok(!calls.includes(P2), "must not fetch further pages");
 });
 
+// --- fill gaps (cursor-less recovery) ----------------------------------------
+
+const PAGE1_IDS = ["t3_txt001", "t3_img002", "t3_gal003", "t3_vid004", "t3_lnk005", "t1_com006", "t3_prf007"];
+const PAGE2_IDS = ["t3_txt008", "t3_txt011", "t1_com009", "t3_ext010", "t3_gal012"];
+
+test("scrapeSaved: fill-gaps walks from page 1, skips known, ranks continue from the global index", async () => {
+  // Vault holds everything from page 1 (the interrupted sync's 200-item case
+  // at fixture scale). Fill gaps must NOT stop at known items: it walks the
+  // whole listing, ranks known items anyway, and collects only what is new.
+  const calls = [];
+  const { items, batches, done } = await runScrape({
+    fetchImpl: mockFetch(baseRoutes(), calls),
+    getKnownIds: () => new Set(PAGE1_IDS),
+    incremental: true, // even with incremental on, skipKnown disables the stop
+    skipKnown: true,
+    startUrl: null, startRank: 0, startPage: 0,
+  });
+  assert.ok(calls.includes(P1), "fill gaps starts from the FIRST page");
+  assert.deepEqual(items.map((i) => i.id), PAGE2_IDS);
+  assert.deepEqual(items.map((i) => i.rank), [7, 8, 9, 10, 11],
+    "known page-1 items consumed ranks 0-6; new items keep their listing positions");
+  assert.equal(batches.length, 1, "all-known page 1 yields no batch; only page 2 writes");
+  assert.equal(batches[0].page, 2);
+  assert.ok(done, "known items must never stop a fill-gaps run");
+});
+
+test("scrapeSaved: fill-gaps maxItems bounds only NEW items (200-item vault can still gain its budget)", async () => {
+  const { items, done } = await runScrape({
+    getKnownIds: () => new Set(PAGE1_IDS), // 7 known
+    incremental: true,
+    skipKnown: true,
+    maxItems: 3, // budget counts newly collected only, not the 7 skipped
+  });
+  assert.equal(items.length, 3);
+  assert.deepEqual(items.map((i) => i.id), ["t3_txt008", "t3_txt011", "t1_com009"]);
+  assert.deepEqual(items.map((i) => i.rank), [7, 8, 9]);
+  assert.ok(done);
+});
+
+// --- listing shift: an id emitted twice in one run ---------------------------
+
+test("scrapeSaved: item reappearing on page 2 (listing shift) is emitted once, first rank kept", async () => {
+  // Splice page 1's t3_txt001 block to the FRONT of page 2's content, as a
+  // shifted listing would: t3_txt001 reappears at global index 7.
+  const l1 = fix("saved_page1.html").split("\n");
+  const i = l1.findIndex((l) => l.includes("id-t3_txt001"));
+  const j = l1.findIndex((l) => l.includes("id-t3_img002"));
+  const dupBlock = l1.slice(i, j).join("\n");
+  const shiftedP2 = fix("saved_page2.html").replace(
+    '<div class="spacer"><div class="thing id-t3_txt008',
+    dupBlock + '\n<div class="spacer"><div class="thing id-t3_txt008',
+  );
+  const routes = [[P2, { status: 200, body: shiftedP2 }], ...baseRoutes()];
+  const { items, events } = await runWithProgress({ routes });
+  const ids = items.map((x) => x.id);
+  assert.equal(ids.length, new Set(ids).size, "no id is emitted twice in one run");
+  assert.equal(items.filter((x) => x.id === "t3_txt001").length, 1);
+  assert.equal(items.find((x) => x.id === "t3_txt001").rank, 0, "keeps its FIRST rank");
+  // the duplicate consumed its shifted listing slot: later ranks stay aligned
+  assert.deepEqual(items.map((x) => x.rank), [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12]);
+  assert.ok(events.length);
+});
+
+test("scrapeSaved: duplicate within ONE page is emitted once too", async () => {
+  // Same block twice on page 2 (batch-level duplicate on the extension side).
+  const p2 = fix("saved_page2.html");
+  const l = p2.split("\n");
+  const i = l.findIndex((x) => x.includes("id-t3_txt008"));
+  const j = l.findIndex((x) => x.includes("id-t3_txt011"));
+  const block = l.slice(i, j).join("\n");
+  const dupPage = p2.replace(block, block + "\n" + block);
+  const routes = [[P2, { status: 200, body: dupPage }], ...baseRoutes()];
+  const { items } = await runScrape({ routes });
+  const txt008 = items.filter((x) => x.id === "t3_txt008");
+  assert.equal(txt008.length, 1);
+  assert.equal(txt008[0].rank, 7);
+});
+
 // --- resume.js (pure cursor helpers + storage adapter) -----------------------
 
 function memoryStore() {
@@ -409,4 +488,40 @@ test("resume: describeCursor wording for the sync page banner", () => {
   assert.equal(describeCursor(c), "Previous sync stopped at page 8 (200 items written)");
   const one = { ...c, page: 1, itemsWritten: 1 };
   assert.equal(describeCursor(one), "Previous sync stopped at page 1 (1 item written)");
+});
+
+test("resume: cursor carries skipKnown so a fill-gaps run stays resumable in its mode", async () => {
+  const store = memoryStore();
+  const c = makeCursor({
+    username: "alice", vaultPath: "/vault", folder: "Reddit",
+    syncId: "2026-10-01T00:00:00Z", nextUrl: P2, nextRank: 207, page: 9,
+    itemsWritten: 200, skipKnown: true,
+  });
+  assert.equal(c.skipKnown, true);
+  await saveCursor(store, c);
+  const loaded = await loadCursor(store);
+  assert.deepEqual(loaded, c);
+  // (a resumed run reads loaded.skipKnown === true and keeps skipping)
+  // default is false (a normal incremental cursor resumes the old way)
+  const plain = makeCursor({
+    username: "a", vaultPath: "/v", folder: "Reddit", syncId: "s",
+    nextUrl: P2, nextRank: 7, page: 1, itemsWritten: 7,
+  });
+  assert.equal(plain.skipKnown, false);
+  // old-version cursors without the field still validate (treated as false)
+  store.data[CURSOR_KEY] = { ...c, skipKnown: undefined };
+  delete store.data[CURSOR_KEY].skipKnown;
+  const legacy = await loadCursor(store);
+  assert.ok(legacy, "cursor without skipKnown (older version) is still valid");
+  assert.equal(legacy.skipKnown ?? true, true, "fallback semantics live in sync.js; field absent here");
+});
+
+test("fillGapsSyncId reuses the vault's lastSyncId, falls back to a fresh timestamp", () => {
+  assert.equal(fillGapsSyncId("2026-10-01T10:00:00Z", "2026-10-29T00:00:00.000Z"), "2026-10-01T10:00:00Z");
+  assert.equal(fillGapsSyncId(null, "2026-10-29T00:00:00.000Z"), "2026-10-29T00:00:00.000Z");
+  assert.equal(fillGapsSyncId("", "2026-10-29T00:00:00.000Z"), "2026-10-29T00:00:00.000Z");
+  assert.equal(fillGapsSyncId(42, "now"), "now");
+  // default arg produces a real ISO timestamp
+  const iso = fillGapsSyncId(null);
+  assert.ok(!Number.isNaN(Date.parse(iso)) && iso.endsWith("Z"));
 });

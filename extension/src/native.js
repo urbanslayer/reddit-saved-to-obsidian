@@ -29,9 +29,19 @@ export async function checkVault(vaultPath) {
   return { exists: !!r.exists, isVault: !!r.isVault };
 }
 
+/**
+ * Known ids + the vault's last sync id.
+ * Returns {ids: string[], lastSyncId: string|null} — lastSyncId is the max
+ * syncId among stored order keys (null when the vault holds nothing). 'Fill
+ * gaps' reuses it so newly found older items sort below existing entries.
+ * Tolerates hosts without lastSyncId support (-> null).
+ */
 export async function getKnownIds(vaultPath, folder) {
   const r = await send({ cmd: "getKnownIds", vaultPath, folder });
-  return Array.isArray(r.ids) ? r.ids : [];
+  return {
+    ids: Array.isArray(r.ids) ? r.ids : [],
+    lastSyncId: typeof r.lastSyncId === "string" && r.lastSyncId ? r.lastSyncId : null,
+  };
 }
 
 /**

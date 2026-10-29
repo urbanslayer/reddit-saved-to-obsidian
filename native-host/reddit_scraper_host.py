@@ -13,12 +13,18 @@ stdio; main() only does framing.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as _dt
 import json
 import os
 import re
 import struct
 import sys
+
+try:
+    import fcntl  # POSIX exclusive locks for concurrent-writer safety
+except ImportError:  # pragma: no cover - platforms without fcntl
+    fcntl = None
 
 VERSION = "0.1.0"
 HOST_NAME = "reddit_scraper_obsidian"
@@ -127,6 +133,8 @@ def validate_item(item) -> str | None:
     if not isinstance(item, dict):
         return "item is not an object"
     id_ = item.get("id")
+    if isinstance(id_, str):
+        id_ = id_.strip()  # ids are normalised (stripped) before keying
     if not isinstance(id_, str) or not _ID_RE.match(id_):
         return "bad id: %r" % (item.get("id"),)
     sub = item.get("subreddit")
@@ -149,6 +157,152 @@ def _containment_check(base_dir: str, target: str, label: str) -> None:
     real = os.path.realpath(target)
     if real != base and not real.startswith(base + os.sep):
         raise HostError("%s escapes vault folder: %s" % (label, target))
+
+
+@contextlib.contextmanager
+def _folder_lock(folder_path: str):
+    """Exclusive lock on <folder>/.reddit-scraper/lock.
+
+    Held for the whole read-modify-write of state.json + notes so two sync
+    tabs / two browsers cannot interleave and duplicate or clobber entries.
+    fcntl.flock is per-open-file-description, so this serialises threads and
+    processes alike; it degrades to a no-op on platforms without fcntl.
+    """
+    state_dir = os.path.join(folder_path, STATE_DIR_NAME)
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        fh = open(os.path.join(state_dir, "lock"), "a+")
+    except OSError as exc:
+        raise HostError("cannot open lock file under %s: %s" % (state_dir, exc))
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+# --------------------------------------------------------------------------
+# Recovering state from rendered notes
+# --------------------------------------------------------------------------
+#
+# state.json is the source of truth, but if it goes missing or corrupt while
+# the subreddit notes are still there, we rebuild entries from the rendered
+# `<!-- rs:ID -->` blocks instead of silently re-adding (or losing) items.
+# Rendered fields round-trip: title/permalink/kind, Type/Author/Posted/First
+# synced/NSFW meta line, optional Link line, blockquoted summary, image.
+
+_ENTRY_MARKER_RE = re.compile(r"^<!-- rs:(t[13]_[a-z0-9]+) -->$")
+_HEADING_POST_RE = re.compile(r"^### \[(.*)\]\((\S+)\)$")
+_HEADING_COMMENT_RE = re.compile(r"^### 💬 Comment on: \[(.*)\]\((\S+)\)$")
+_META_TYPE_RE = re.compile(r"\*\*Type:\*\* ([^·]+)")
+_META_AUTHOR_RE = re.compile(r"\*\*Author:\*\* u/([^·]+)")
+_META_POSTED_RE = re.compile(r"\*\*Posted:\*\* (\d{4}-\d{2}-\d{2})")
+_META_SYNCED_RE = re.compile(r"\*\*First synced:\*\* (\S+)")
+_LINK_LINE_RE = re.compile(r"^- \*\*Link:\*\* (\S+)$")
+_IMAGE_LINE_RE = re.compile(r"^!\[\]\((.*)\)$")
+_NOTE_FILE_POST_RE = re.compile(r"^r-(.+)\.md$")
+_NOTE_FILE_USER_RE = re.compile(r"^u-(.+)\.md$")
+
+
+def _unescape_link_text(text: str) -> str:
+    return text.replace("\\]", "]").replace("\\[", "[").replace("\\\\", "\\")
+
+
+def _epoch_from_date(date_str: str) -> int:
+    try:
+        d = _dt.datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
+        return int(d.timestamp())
+    except ValueError:
+        return 0
+
+
+def _parse_entry_block(entry_id: str, heading: str, body: list, subreddit: str, rank: int) -> dict | None:
+    """Rebuild one Item record from a rendered entry, or None if unparseable."""
+    kind = "comment"
+    hm = _HEADING_COMMENT_RE.match(heading)
+    if hm is None:
+        kind = "post"
+        hm = _HEADING_POST_RE.match(heading)
+    if hm is None:
+        log("recovery: unparseable heading for %s: %r" % (entry_id, heading))
+        return None
+    title, permalink = _unescape_link_text(hm.group(1)), hm.group(2)
+    meta = next((l[2:] for l in body if l.startswith("- **Type:**")), "")
+    type_m = _META_TYPE_RE.search(meta)
+    author_m = _META_AUTHOR_RE.search(meta)
+    posted_m = _META_POSTED_RE.search(meta)
+    synced_m = _META_SYNCED_RE.search(meta)
+    link_m = next((_LINK_LINE_RE.match(l) for l in body if _LINK_LINE_RE.match(l)), None)
+    image_m = next((_IMAGE_LINE_RE.match(l) for l in body if _IMAGE_LINE_RE.match(l)), None)
+    summary_lines = []
+    in_quote = False
+    for line in body:
+        if line.startswith(">"):
+            in_quote = True
+            stripped = line[1:]
+            summary_lines.append(stripped[1:] if stripped.startswith(" ") else stripped)
+        elif in_quote and not line.strip():
+            continue  # blank lines inside/after the blockquote are not entry content
+        elif in_quote:
+            break  # image line or anything else ends the summary
+    summary = "\n".join(summary_lines).strip()
+    if summary == "_(no summary)_":
+        summary = ""
+    post_type = type_m.group(1).strip() if type_m else ("comment" if kind == "comment" else "text")
+    return {
+        "id": entry_id,
+        "kind": kind,
+        "subreddit": subreddit,
+        "title": title,
+        "permalink": permalink,
+        "url": link_m.group(1) if link_m else permalink,
+        "author": author_m.group(1).strip() if author_m else "unknown",
+        "createdUtc": _epoch_from_date(posted_m.group(1)) if posted_m else 0,
+        "postType": post_type,
+        "summary": summary,
+        "summarySource": "comment" if kind == "comment" else ("image-fallback" if image_m else "selftext"),
+        "imageUrl": image_m.group(1) if image_m else None,
+        "nsfw": "NSFW" in meta,
+        "rank": rank,
+        # The note only records the First-synced DATE; the rank is this
+        # entry's display position, which reproduces the old sort order
+        # within that sync (same day, same relative order).
+        "order": {"syncId": synced_m.group(1) if synced_m else "0000-00-00", "rank": rank},
+    }
+
+
+def parse_note_entries(text: str, subreddit: str) -> list:
+    """Extract Item records from a rendered subreddit note (display order kept)."""
+    lines = [l.rstrip("\r") for l in text.split("\n")]
+    for i, line in enumerate(lines):
+        if line == NOTES_HEADING:  # user-notes tail is not item content
+            lines = lines[:i]
+            break
+    entries = []
+    rank = 0
+    i = 0
+    while i < len(lines):
+        m = _ENTRY_MARKER_RE.match(lines[i])
+        if m and i > 0:
+            heading = lines[i - 1]
+            body = []
+            j = i + 1
+            while j < len(lines) and lines[j] != "---" and not _ENTRY_MARKER_RE.match(lines[j]):
+                body.append(lines[j])
+                j += 1
+            entry = _parse_entry_block(m.group(1), heading, body, subreddit, rank)
+            if entry is not None:
+                entries.append(entry)
+                rank += 1
+            i = j
+        else:
+            i += 1
+    return entries
 
 
 # --------------------------------------------------------------------------
@@ -215,15 +369,79 @@ class VaultWriter:
     # -- state ------------------------------------------------------------
 
     def load_state(self) -> dict:
+        """Load state.json, recovering from rendered notes when it is gone.
+
+        - Missing: rebuild from the notes if any entries exist (else empty).
+        - Corrupt: move the file aside as state.json.corrupt-<timestamp>,
+          then rebuild from the notes.
+        This keeps getKnownIds honest (the extension still skips those ids)
+        and stops a lost state file from duplicating every entry on the next
+        write.
+        """
         try:
             with open(self.state_path, encoding="utf-8") as fh:
                 state = json.load(fh)
         except FileNotFoundError:
-            return {"items": {}}
-        except (json.JSONDecodeError, OSError) as exc:
-            raise HostError("corrupt state.json (%s): %s" % (self.state_path, exc))
+            return self._recover_state_from_notes(cause="missing")
+        except json.JSONDecodeError as exc:
+            backup = self._backup_corrupt_state()
+            log("corrupt state.json (%s); %s" % (exc, "backed up to %s" % backup if backup else "backup failed"))
+            return self._recover_state_from_notes(cause="corrupt")
+        except OSError as exc:
+            raise HostError("cannot read state.json (%s): %s" % (self.state_path, exc))
         if not isinstance(state, dict) or not isinstance(state.get("items"), dict):
             raise HostError("malformed state.json: %s" % self.state_path)
+        return state
+
+    def _backup_corrupt_state(self) -> str | None:
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
+        target = "%s.corrupt-%s" % (self.state_path, ts)
+        n = 1
+        while os.path.exists(target):
+            target = "%s.corrupt-%s-%d" % (self.state_path, ts, n)
+            n += 1
+        try:
+            os.replace(self.state_path, target)
+            return target
+        except OSError as exc:
+            log("could not back up corrupt state.json: %s" % exc)
+            return None
+
+    def _recover_state_from_notes(self, cause: str) -> dict:
+        items: dict = {}
+        try:
+            names = sorted(os.listdir(self.folder_path))
+        except FileNotFoundError:
+            names = []
+        for name in names:
+            if name == INDEX_NAME or not name.endswith(".md"):
+                continue
+            if _NOTE_FILE_POST_RE.match(name):
+                subreddit = name[2:-3]
+            elif _NOTE_FILE_USER_RE.match(name):
+                subreddit = "u_%s" % name[2:-3]
+            else:
+                continue
+            path = os.path.join(self.folder_path, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as exc:
+                log("recovery: cannot read note %s: %s" % (name, exc))
+                continue
+            for entry in parse_note_entries(text, subreddit):
+                if entry["id"] not in items:
+                    items[entry["id"]] = entry
+        if not items:
+            return {"items": {}}
+        log("state.json %s: rebuilt %d item(s) from notes under %s" % (cause, len(items), self.folder_path))
+        state = {"items": items}
+        try:
+            self.save_state(state)  # persist the recovery so it is durable
+        except HostError as exc:
+            log("recovery: could not persist rebuilt state: %s" % exc)
         return state
 
     def save_state(self, state: dict) -> None:
@@ -236,7 +454,24 @@ class VaultWriter:
         os.replace(tmp, self.state_path)
 
     def known_ids(self) -> list:
-        return sorted(self.load_state()["items"].keys())
+        return self.known_info()["ids"]
+
+    def known_info(self) -> dict:
+        """{ids, lastSyncId}: known ids + max syncId among stored order keys.
+
+        lastSyncId (null when the vault is empty) lets the extension run
+        'Fill gaps' with the ORIGINAL sync id, so newly found older items
+        sort below the existing ones and save-order is preserved.
+        """
+        with _folder_lock(self.folder_path):
+            items = self.load_state()["items"]
+        sync_ids = []
+        for it in items.values():
+            order = it.get("order") if isinstance(it, dict) else None
+            sid = order.get("syncId") if isinstance(order, dict) else None
+            if isinstance(sid, str) and sid:
+                sync_ids.append(sid)
+        return {"ids": sorted(items.keys()), "lastSyncId": max(sync_ids) if sync_ids else None}
 
     # -- write ------------------------------------------------------------
 
@@ -247,38 +482,48 @@ class VaultWriter:
         items = msg.get("items")
         if not isinstance(items, list):
             raise HostError("items must be a list")
-        self._makedirs(self.folder_path)
-        state = self.load_state()
-        stored = state["items"]
-        added = updated = skipped = 0
-        touched: set = set()
-        for item in items:
-            reason = validate_item(item)
-            if reason:
-                skipped += 1
-                log("skipping invalid item (%s): %r" % (reason, item.get("id") if isinstance(item, dict) else item))
-                continue
-            record = dict(item)
-            known = stored.get(record["id"])
-            if known is not None:
-                record["order"] = known.get("order") or {
-                    "syncId": sync_id,
-                    "rank": record.get("rank", 0),
-                }
-                updated += 1
-            else:
-                rank = record.get("rank")
-                record["order"] = {
-                    "syncId": sync_id,
-                    "rank": rank if isinstance(rank, int) and not isinstance(rank, bool) else 0,
-                }
-                added += 1
-            stored[record["id"]] = record
-            touched.add(record["subreddit"])
-        self.save_state(state)
-        for sub in touched:
-            self.write_subreddit_note(sub, state)
-        self.write_index(state)
+        with _folder_lock(self.folder_path):
+            state = self.load_state()
+            stored = state["items"]
+            # Collapse duplicate ids WITHIN the batch: last copy wins, the id
+            # is counted once (a listing that shifts mid-pagination can make
+            # the scraper emit the same item twice in one page).
+            batch: dict = {}
+            skipped = 0
+            for item in items:
+                reason = validate_item(item)
+                if reason:
+                    skipped += 1
+                    log("skipping invalid item (%s): %r" % (reason, item.get("id") if isinstance(item, dict) else item))
+                    continue
+                record = dict(item)
+                record["id"] = record["id"].strip()
+                batch[record["id"]] = record
+            added = updated = 0
+            touched: set = set()
+            for id_, record in batch.items():
+                known = stored.get(id_)
+                if known is not None:
+                    # Known id: update fields IN PLACE, keep the original
+                    # order key — never a second entry for one fullname.
+                    record["order"] = known.get("order") or {
+                        "syncId": sync_id,
+                        "rank": record.get("rank", 0),
+                    }
+                    updated += 1
+                else:
+                    rank = record.get("rank")
+                    record["order"] = {
+                        "syncId": sync_id,
+                        "rank": rank if isinstance(rank, int) and not isinstance(rank, bool) else 0,
+                    }
+                    added += 1
+                stored[id_] = record
+                touched.add(record["subreddit"])
+            self.save_state(state)
+            for sub in touched:
+                self.write_subreddit_note(sub, state)
+            self.write_index(state)
         return {
             "ok": True,
             "added": added,
@@ -436,7 +681,7 @@ def handle_message(msg) -> dict:
             exists = os.path.isdir(path)
             return {"ok": True, "exists": exists, "isVault": exists and os.path.isdir(os.path.join(path, ".obsidian"))}
         if cmd == "getKnownIds":
-            return {"ok": True, "ids": _writer_for(msg).known_ids()}
+            return {"ok": True, **_writer_for(msg).known_info()}
         if cmd == "writeItems":
             return _writer_for(msg).write_items(msg)
         raise HostError("unknown cmd: %r" % (cmd,))

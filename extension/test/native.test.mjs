@@ -27,17 +27,24 @@ test("ping / checkVault / getKnownIds wire the contract exactly", async () => {
   respond((host, msg) => {
     if (msg.cmd === "ping") return { ok: true, version: "0.1.0" };
     if (msg.cmd === "checkVault") return { ok: true, exists: true, isVault: msg.vaultPath === "/v" };
-    if (msg.cmd === "getKnownIds") return { ok: true, ids: ["t3_a", "t1_b"] };
+    if (msg.cmd === "getKnownIds") return { ok: true, ids: ["t3_a", "t1_b"], lastSyncId: "2026-10-01T00:00:00Z" };
     throw new Error("unexpected " + msg.cmd);
   });
   assert.deepEqual(await native.ping(), { version: "0.1.0" });
   assert.deepEqual(await native.checkVault("/v"), { exists: true, isVault: true });
-  assert.deepEqual(await native.getKnownIds("/v", "Reddit"), ["t3_a", "t1_b"]);
+  assert.deepEqual(await native.getKnownIds("/v", "Reddit"), { ids: ["t3_a", "t1_b"], lastSyncId: "2026-10-01T00:00:00Z" });
   assert.deepEqual(sent.map((s) => [s.host, s.msg.cmd]), [
     ["reddit_scraper_obsidian", "ping"],
     ["reddit_scraper_obsidian", "checkVault"],
     ["reddit_scraper_obsidian", "getKnownIds"],
   ]);
+});
+
+test("getKnownIds is backward compatible: no lastSyncId from an old host -> null", async () => {
+  respond(() => ({ ok: true, ids: ["t3_a"] }));
+  assert.deepEqual(await native.getKnownIds("/v", "Reddit"), { ids: ["t3_a"], lastSyncId: null });
+  respond(() => ({ ok: true, ids: [], lastSyncId: null }));
+  assert.deepEqual(await native.getKnownIds("/v", "Reddit"), { ids: [], lastSyncId: null });
 });
 
 test("writeItems batches in chunks of <=50 sharing syncId", async () => {

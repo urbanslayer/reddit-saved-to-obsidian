@@ -51,7 +51,7 @@ Every response has `ok: boolean`; on failure `error: string`.
 |---|---|
 | `{"cmd":"ping"}` | `{"ok":true,"version":"0.1.0"}` |
 | `{"cmd":"checkVault","vaultPath":P}` | `{"ok":true,"exists":bool,"isVault":bool}` (`isVault` = has `.obsidian/`) |
-| `{"cmd":"getKnownIds","vaultPath":P,"folder":F}` | `{"ok":true,"ids":["t3_abc", "t1_def", ...]}` |
+| `{"cmd":"getKnownIds","vaultPath":P,"folder":F}` | `{"ok":true,"ids":["t3_abc", "t1_def", ...],"lastSyncId":S\|null}` (`lastSyncId` = max `syncId` among stored order keys; `null` when the vault holds nothing) |
 | `{"cmd":"writeItems","vaultPath":P,"folder":F,"syncId":S,"items":[Item…]}` | `{"ok":true,"added":n,"updated":n,"subreddits":["Python",…]}` |
 
 - `vaultPath` must be absolute and exist; `folder` is a single relative path segment-safe name
@@ -151,17 +151,74 @@ shared helper, `fetchResilient(fetchImpl, url, init, ctx)`:
 
 Batches are written per listing page; after each *successful* write the sync
 page persists a cursor in `storage.local` (key `resumeCursor`):
-`{username, vaultPath, folder, syncId, nextUrl, nextRank, page, itemsWritten, updatedAt}`.
+`{username, vaultPath, folder, syncId, nextUrl, nextRank, page, itemsWritten, skipKnown, updatedAt}`.
 
 - On sync-page load, a cursor matching the current username/vaultPath/folder
   shows: *Previous sync stopped at page N (X items written) — [Resume] [Start over]*.
 - **Resume** calls `scrapeSaved` with `startUrl = nextUrl`, `startRank =
-  nextRank`, `startPage = page`, the **same syncId**, and `skipKnown = true`:
-  known ids are skipped (not fetched/summarised/written) but still consume a
-  rank — keeping ordering consistent with the host's `order` key — and never
-  stop the run (the incremental stop-at-first-known rule is disabled).
+  nextRank`, `startPage = page`, the **same syncId**, and `skipKnown` from the
+  cursor (older cursors without the field fall back to the incremental
+  setting): known ids are skipped (not fetched/summarised/written) but still
+  consume a rank — keeping ordering consistent with the host's `order` key —
+  and never stop the run (the incremental stop-at-first-known rule is disabled).
 - **Start over** clears the cursor and runs normally.
 - A normal completion (no pending `nextUrl`) clears the cursor.
 - In a normal incremental run, the first item already being known stops
   immediately — correct behaviour for an up-to-date vault.
+- `maxItems` bounds only the items **newly collected** by the run: skipped
+  known items never count against it, so a vault holding 200 items with
+  `maxItems 1000` can still gain up to 1000 new items in resume/fill-gaps runs.
 - `src/resume.js` is pure (storage adapter injected) and unit-tested.
+
+## Fill gaps (cursor-less recovery)
+
+A sync interrupted **before the resume-cursor feature existed** (or whose
+cursor was lost) cannot Resume: pressing Start would stop at the first known
+item, so the never-fetched tail stays unreachable forever. The sync page's
+**Fill gaps** button fixes that:
+
+- Walks the saved listing **from the first page** with `skipKnown = true`
+  (known items cost no detail fetches, no summaries, no writes — they only
+  consume a rank) and `rank` starting at 0 (global listing index).
+- Uses `syncId = lastSyncId` from `getKnownIds` when the host reports one, so
+  newly found older items land in the **same order bucket** as the existing
+  entries and sort **below** them within that sync — save-order is preserved.
+  With no `lastSyncId` (empty/recovered vault) it falls back to a fresh ISO
+  timestamp.
+- Saves/clears the resume cursor exactly like a normal run, with `skipKnown:
+  true` recorded — a 429 during Fill gaps is resumable **in the same mode**
+  (Resume will not stop at known items).
+- `maxItems` counts only newly collected items (see above).
+
+## No-duplicates guarantee
+
+Running the scrape any number of times, in any mode (full, incremental,
+resume, fill gaps), possibly from two tabs at once, never duplicates an entry
+in the vault:
+
+- **Host keying**: items are keyed by Reddit fullname id; ids are stripped
+  (validated lowercase `t1_`/`t3_` prefix). Duplicate ids **within one
+  `writeItems` batch** collapse (last copy wins, counted once). A known id is
+  always **updated in place**, keeping its original `order` key — never a
+  second entry. Notes are regenerated from `state.json`, so every
+  `<!-- rs:ID -->` marker appears exactly once.
+- **State recovery**: if `.reddit-scraper/state.json` is missing, state is
+  rebuilt from the rendered notes before applying the write; if it is corrupt,
+  it is moved aside to `state.json.corrupt-<timestamp>` and rebuilt. Parsing
+  uses the `<!-- rs:ID -->` blocks (heading/permalink/kind, meta line, Link
+  line, blockquoted summary, image) and assigns order keys from the
+  *First synced* date + display position, reproducing the previous sort.
+  `getKnownIds` uses the same recovery, so the extension still skips those
+  ids instead of re-syncing (and potentially forking) them.
+- **Concurrency**: every read-modify-write of state + notes runs under an
+  exclusive `fcntl.flock` on `.reddit-scraper/lock` (no-op fallback where
+  `fcntl` is unavailable), serialising two sync tabs / two browsers.
+- **Scraper**: each id is emitted at most once per run — an item reappearing
+  on a later page (listing shift during pagination) keeps its first rank and
+  the duplicate is dropped, so an id is never sent to the host twice in one
+  sync. The host additionally collapses it (above).
+- **Sync tabs**: while a run is active the sync page keeps a
+  `storage.local` flag (`syncRunning`, `{tabId, startedAt, updatedAt}`) with
+  a 30 s heartbeat; a second tab refuses to start while the flag is fresh
+  (stale after 2 min — a crashed tab stops blocking). Start / Resume / Fill
+  gaps buttons are disabled while a run is active in this tab.

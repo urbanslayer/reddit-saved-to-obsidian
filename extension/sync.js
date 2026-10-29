@@ -6,7 +6,9 @@ import { REQUIRED_ORIGINS } from "./src/origins.js";
 import * as native from "./src/native.js";
 import {
   makeCursor, saveCursor, loadCursor, clearCursor, cursorMatches, describeCursor,
+  fillGapsSyncId,
 } from "./src/resume.js";
+import * as synclock from "./src/synclock.js";
 
 const $ = (id) => document.getElementById(id);
 const logEl = $("log");
@@ -108,11 +110,19 @@ $("cancel").addEventListener("click", () => {
   log("cancel requested…");
 });
 
+// --- cross-tab concurrency guard ---------------------------------------------
+// Identity of this page instance; recorded in storage.local while a run is
+// active so a second sync tab refuses to start (see src/synclock.js).
+const runToken = globalThis.crypto?.randomUUID?.()
+  ?? `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+let heartbeatTimer = null;
+
 function setButtons(isRunning) {
   running = isRunning;
   $("start").disabled = isRunning;
   $("resumeBtn").disabled = isRunning;
   $("restartBtn").disabled = isRunning;
+  $("fillGaps").disabled = isRunning;
   $("cancel").disabled = !isRunning;
   renderResumeBanner();
 }
@@ -131,19 +141,46 @@ $("start").addEventListener("click", async () => {
     cursor = null;
     log("resume cursor discarded (Start over).");
   }
-  await startSync(null);
+  await startSync({});
 });
 
 $("resumeBtn").addEventListener("click", async () => {
-  await startSync(matchingCursor());
+  await startSync({ resumeCursor: matchingCursor() });
+});
+
+$("fillGaps").addEventListener("click", async () => {
+  // Fill gaps starts from page 1; the old cursor (if any) is replaced by the
+  // fill-gaps run's own cursor after its first written page.
+  if (matchingCursor()) {
+    await clearCursor(store);
+    cursor = null;
+    log("resume cursor discarded (Fill gaps starts from the first page).");
+  }
+  await startSync({ fillGaps: true });
 });
 
 /**
- * @param {object|null} resumeCursor  saved cursor to continue from (same
- *   syncId/rank, known ids skipped instead of stopping the run), or null for
- *   a fresh run.
+ * @param {object} opts
+ * @param {object|null} [opts.resumeCursor]  saved cursor to continue from
+ *   (same syncId/rank; known ids handled per the cursor's skipKnown flag),
+ *   or null for a fresh run.
+ * @param {boolean} [opts.fillGaps] cursor-less recovery mode: walk the whole
+ *   saved listing from page 1 with skipKnown=true (known items cost nothing
+ *   but a rank), reusing the vault's lastSyncId so newly found older items
+ *   sort BELOW the existing entries (save-order preserved).
  */
-async function startSync(resumeCursor) {
+async function startSync({ resumeCursor = null, fillGaps = false } = {}) {
+  if (running) return; // one run per page, full stop
+  const lock = await synclock.tryAcquire(store, runToken);
+  if (!lock.acquired) {
+    setStatus($("final"), "warn",
+      `Another sync tab is already running (since ${new Date(lock.holder.startedAt).toLocaleString()}). ` +
+      `Wait for it to finish — concurrent syncs race on the vault.`);
+    return;
+  }
+  heartbeatTimer = setInterval(() => {
+    synclock.heartbeat(store, runToken).catch(() => {});
+  }, 30_000);
   controller = new AbortController();
   setButtons(true);
   clearStatus($("final"));
@@ -151,13 +188,18 @@ async function startSync(resumeCursor) {
   $("bar").style.width = "0%";
   t0 = Date.now();
 
-  const syncId = resumeCursor?.syncId || new Date().toISOString();
   // Running totals: items are written to the vault page-by-page (per scraper
   // 'batch' event, same syncId), so a 429/cancel later keeps partial progress.
   let scraped = resumeCursor?.itemsWritten || 0;
   let added = 0;
   let updated = 0;
   const bySub = {};
+  let syncId = resumeCursor?.syncId || null; // fill-gaps picks it after getKnownIds
+  // skipKnown: always on for fill-gaps; for resume, honour the cursor
+  // (older cursors without the field fall back to the incremental setting).
+  const skipKnown = fillGaps
+    ? true
+    : resumeCursor ? (resumeCursor.skipKnown ?? settings.incremental) : false;
   try {
     if (!settings.username || !settings.vaultPath) {
       throw new Error(`Configure ${[!settings.username && "username", !settings.vaultPath && "vault path"].filter(Boolean).join(" and ")} in Options first.`);
@@ -166,30 +208,44 @@ async function startSync(resumeCursor) {
       throw new Error("Reddit access not granted — click 'Grant access' above.");
     }
 
-    log(resumeCursor
-      ? `resuming sync ${syncId} at page ${resumeCursor.page + 1} (rank ${resumeCursor.nextRank}, ${scraped} item(s) already written) · u/${settings.username} → ${settings.vaultPath}/${settings.folder}`
-      : `sync ${syncId} · u/${settings.username} → ${settings.vaultPath}/${settings.folder}`);
+    log(fillGaps
+      ? `fill gaps · u/${settings.username} → ${settings.vaultPath}/${settings.folder}`
+      : resumeCursor
+        ? `resuming sync at page ${resumeCursor.page + 1} (rank ${resumeCursor.nextRank}, ${scraped} item(s) already written) · u/${settings.username} → ${settings.vaultPath}/${settings.folder}`
+        : `sync · u/${settings.username} → ${settings.vaultPath}/${settings.folder}`);
     const v = await native.checkVault(settings.vaultPath);
     if (!v.exists) throw new Error(`Vault path does not exist: ${settings.vaultPath}`);
     if (!v.isVault) log(`warning: ${settings.vaultPath} has no .obsidian/ folder (writing anyway)`);
 
-    const knownIds = await native.getKnownIds(settings.vaultPath, settings.folder);
-    log(`host has ${knownIds.length} known item(s)`);
+    const known = await native.getKnownIds(settings.vaultPath, settings.folder);
+    log(`host has ${known.ids.length} known item(s)${known.lastSyncId ? ` (last sync id ${known.lastSyncId})` : ""}`);
+    if (fillGaps) {
+      syncId = fillGapsSyncId(known.lastSyncId);
+      log(known.lastSyncId
+        ? `reusing vault syncId ${syncId}: missing items sort below the existing entries`
+        : `vault holds nothing with a sync id — fill gaps starts a fresh syncId ${syncId}`);
+    } else if (!syncId) {
+      syncId = new Date().toISOString();
+    }
+    log(`syncId ${syncId}${skipKnown ? " (known ids skipped, never a stop)" : ""}`);
 
     for await (const ev of scrapeSaved({
       username: settings.username,
       delayMs: settings.delayMs,
-      // In resume mode, items already written count against the budget.
-      maxItems: Math.max(1, settings.maxItems - (resumeCursor ? scraped : 0)),
+      // maxItems bounds only the items NEWLY COLLECTED this run: known items
+      // are skipped without counting, so a vault of 200 with maxItems 1000
+      // can still gain up to 1000 new items in fill-gaps/resume runs.
+      maxItems: settings.maxItems,
       incremental: settings.incremental,
       embedImages: settings.embedImages,
-      getKnownIds: () => knownIds,
-      // Resume options: continue at the stored URL/rank with the same syncId;
-      // known items are skipped (still consuming a rank), never a stop signal.
+      getKnownIds: () => known.ids,
+      // Resume: continue at the stored URL/rank with the same syncId.
+      // Fill gaps: page 1, rank 0, the vault's lastSyncId. Both use skipKnown
+      // so known items are skipped (still consuming a rank), never a stop.
       startUrl: resumeCursor?.nextUrl || null,
       startRank: resumeCursor?.nextRank || 0,
       startPage: resumeCursor?.page || 0,
-      skipKnown: !!resumeCursor && settings.incremental,
+      skipKnown,
       signal: controller?.signal,
       summariseAll: (chunk, ctx) => summariseAll(chunk, {
         settings, signal: ctx.signal,
@@ -220,6 +276,7 @@ async function startSync(resumeCursor) {
         log(`page ${ev.page} written: +${r.added} new, ~${r.updated} updated (total so far: ${scraped} item(s))`);
         $("bar").style.width = "90%";
         // Persist the resume cursor only after this page is safely in the vault.
+        // skipKnown rides along so a 429 during fill-gaps resumes in the SAME mode.
         if (ev.nextUrl) {
           cursor = await saveCursor(store, makeCursor({
             username: settings.username,
@@ -230,6 +287,7 @@ async function startSync(resumeCursor) {
             nextRank: ev.nextRank,
             page: ev.page,
             itemsWritten: scraped,
+            skipKnown,
           }));
         } else {
           await clearCursor(store);
@@ -247,7 +305,7 @@ async function startSync(resumeCursor) {
 
     const subs = Object.entries(bySub).sort((a, b) => b[1] - a[1]);
     const lines = [
-      `Done. ${scraped} item(s): +${added} new, ~${updated} updated.`,
+      `${fillGaps ? "Fill gaps done" : "Done"}. ${scraped} item(s): +${added} new, ~${updated} updated.`,
       subs.length ? `Per subreddit: ${subs.map(([s, n]) => `r/${s}: ${n}`).join(" · ")}` : "Nothing new to write.",
     ];
     setStatus($("final"), "ok", lines.join("\n"));
@@ -265,6 +323,8 @@ async function startSync(resumeCursor) {
     log(`ERROR: ${err.stack || err.message}`);
   } finally {
     stopCountdown();
+    if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    await synclock.release(store, runToken);
     setButtons(false);
   }
 }

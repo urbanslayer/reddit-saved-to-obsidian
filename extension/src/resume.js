@@ -15,6 +15,7 @@ export const CURSOR_KEY = "***";
 export function makeCursor({
   username, vaultPath, folder, syncId,
   nextUrl, nextRank, page, itemsWritten,
+  skipKnown = false,
   updatedAt = new Date().toISOString(),
 }) {
   return {
@@ -26,6 +27,10 @@ export function makeCursor({
     nextRank: Math.max(0, Math.floor(Number(nextRank) || 0)),
     page: Math.max(0, Math.floor(Number(page) || 0)),
     itemsWritten: Math.max(0, Math.floor(Number(itemsWritten) || 0)),
+    // True for cursors from skipKnown runs (fill-gaps, or resume of one):
+    // a resumed run must keep skipping known items, not stop at them.
+    // Absent on cursors written by older versions (treated as false).
+    skipKnown: !!skipKnown,
     updatedAt,
   };
 }
@@ -37,7 +42,8 @@ export function isCursor(c) {
     && typeof c.nextUrl === "string" && c.nextUrl !== ""
     && typeof c.syncId === "string" && c.syncId !== ""
     && Number.isFinite(c.nextRank) && Number.isFinite(c.page)
-    && Number.isFinite(c.itemsWritten);
+    && Number.isFinite(c.itemsWritten)
+    && (c.skipKnown === undefined || typeof c.skipKnown === "boolean");
 }
 
 export async function saveCursor(store, cursor) {
@@ -72,4 +78,14 @@ export function cursorMatches(cursor, { username, vaultPath, folder }) {
 export function describeCursor(cursor) {
   const n = cursor.itemsWritten;
   return `Previous sync stopped at page ${cursor.page} (${n} item${n === 1 ? "" : "s"} written)`;
+}
+
+/**
+ * syncId for a 'Fill gaps' run: reuse the vault's lastSyncId so items the
+ * interrupted sync never reached get the SAME order bucket as the existing
+ * entries — new (older-in-listing) items land below them, preserving
+ * save-order. Falls back to a fresh timestamp for an empty vault.
+ */
+export function fillGapsSyncId(lastSyncId, nowIso = new Date().toISOString()) {
+  return typeof lastSyncId === "string" && lastSyncId !== "" ? lastSyncId : nowIso;
 }

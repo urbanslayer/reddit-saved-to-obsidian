@@ -24,8 +24,15 @@
   </div>
   <div class="row">
     <button id="start" class="primary">Start sync</button>
+    <button id="fillGaps">Fill gaps</button>
     <button id="cancel" disabled>Cancel</button>
   </div>
+  <p style="font-size:0.85em;opacity:0.75;margin:0.25rem 0 0">
+    <b>Fill gaps</b>: walk the whole saved list from the top, skipping posts
+    already in the vault, and add any that are missing — use after an
+    interrupted sync with no Resume available. It reuses the vault's last sync
+    id, so found items keep their saved-order position.
+  </p>
   <div class="progress"><div id="bar"></div></div>
   <div id="rateStatus" class="status warn"></div>
   <div id="log"></div>
