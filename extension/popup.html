@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="src/shared.css">
+  <style>body { width: 320px; } main { padding: 14px; max-width: none; }</style>
+</head>
+<body>
+  <main>
+    <h1>Reddit Saved → Obsidian</h1>
+    <div class="kv">
+      <b>User</b><span id="who">—</span>
+      <b>Vault</b><span id="vault">—</span>
+      <b>Folder</b><span id="folder">—</span>
+    </div>
+    <div id="permWarn" class="status warn">old.reddit.com access is not granted yet (Firefox asks per-site). Open the sync page to grant it.</div>
+    <div class="row">
+      <button id="openSync" class="primary">Open sync page</button>
+      <button id="openOptions">Options</button>
+    </div>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

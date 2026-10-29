@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en"><head><title>Quantization notes: q4 vs q6 on long context (r/LocalLLaMA) (old.reddit)</title>
+<meta property="og:image" content="https://preview.redd.it/ogfallback.jpg?width=1080&amp;format=png&amp;auto=webp&amp;s=abc"></head>
+<body class="comments-page logged-in">
+<div id="header"><div id="header-bottom-right"><span class="user"><a href="/user/testuser/">testuser</a></span></div></div>
+<div class="spacer"><div class="thing id-t3_txt011 link self" data-fullname="t3_txt011" data-type="link"
+  data-domain="self.LocalLLaMA" data-author="henry" data-subreddit="LocalLLaMA"
+  data-permalink="/r/LocalLLaMA/comments/txt011/quantization-notes/" data-url="/r/LocalLLaMA/comments/txt011/quantization-notes/"
+  data-timestamp="1714370000000" data-nsfw="false" id="thing_t3_txt011">
+  <div class="entry">
+    <a class="title" href="/r/LocalLLaMA/comments/txt011/quantization-notes/">Quantization notes: q4 vs q6 on long context</a>
+    <div class="expando">
+      <div class="usertext">
+        <div class="usertext-body"><div class="md">
+          <p>q4_k_m loses coherence past 32k tokens on my eval set. The perplexity delta is small but the retrieval tasks collapse.</p>
+          <p>q6_k holds up to 64k comfortably. If you have the VRAM, take the hit.</p>
+          <pre><code>llama-cli -m model-q4km.gguf -c 32768</code></pre>
+          <p>Happy to share the harness if anyone wants to reproduce.</p>
+        </div></div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<div class="commentarea">
+  <div class="thing id-t1_cmt100 comment" data-fullname="t1_cmt100" data-type="comment" data-author="sam" data-subreddit="LocalLLaMA"
+    data-permalink="/r/LocalLLaMA/comments/txt011/quantization-notes/cmt100/" data-timestamp="1714371000000">
+    <div class="entry"><div class="usertext"><div class="usertext-body"><div class="md"><p>Matches my results with gemma.</p></div></div></div></div>
+  </div>
+</div>
+</body></html>

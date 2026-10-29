@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Reddit Saved to Obsidian",
+  "version": "0.1.0",
+  "description": "Scrapes a Reddit user's saved posts/comments from old.reddit.com HTML (no Reddit API) and writes them into an Obsidian vault folder via a native messaging host.",
+  "permissions": ["storage", "nativeMessaging", "tabs"],
+  "host_permissions": [
+    "https://old.reddit.com/*",
+    "https://www.reddit.com/*",
+    "https://i.redd.it/*",
+    "https://preview.redd.it/*"
+  ],
+  "optional_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*/*"
+  ],
+  "optional_host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "https://*/*"
+  ],
+  "action": {
+    "default_title": "Reddit Saved to Obsidian",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "icons": {
+    "48": "icons/icon48.png",
+    "96": "icons/icon96.png"
+  }
+}

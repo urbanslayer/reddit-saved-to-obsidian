@@ -1,0 +1,16 @@
+{
+  "name": "reddit-scraper-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MV3 extension: scrape old.reddit.com saved items into an Obsidian vault via native messaging (no Reddit API).",
+  "scripts": {
+    "test": "node --test test/",
+    "build": "node scripts/build.mjs",
+    "lint:firefox": "npx web-ext lint --source-dir dist/firefox"
+  },
+  "devDependencies": {
+    "jsdom": "^26.1.0",
+    "web-ext": "^8.6.0"
+  }
+}
