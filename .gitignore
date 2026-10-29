@@ -1,0 +1,8 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.worktrees/
+test-vault/Reddit/
+test-vault/.obsidian/workspace*.json
+web-ext-artifacts/
