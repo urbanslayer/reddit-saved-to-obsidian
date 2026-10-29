@@ -20,8 +20,9 @@ npx web-ext lint --source-dir dist/firefox   # 0 errors expected
 1. Build (`node scripts/build.mjs`).
 2. Open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** →
    pick `dist/firefox/manifest.json`.
-   (For a permanent install use `web-ext run --source-dir dist/firefox`, or
-   sign it; temporary add-ons disappear on restart.)
+   (For a permanent install in release Firefox, sign it — see
+   **Permanent install in Firefox** below; temporary add-ons and `web-ext run`
+   windows disappear on restart.)
 3. Log in to **old.reddit.com** as the configured user (saved items are private —
    the extension detects and reports a login wall or a wrong-user mismatch).
 4. Options → set username, vault path (e.g. the repo's `test-vault/`), folder →
@@ -30,6 +31,40 @@ npx web-ext lint --source-dir dist/firefox   # 0 errors expected
 5. Open the **sync page** (popup → "Open sync page"). On Firefox MV3, host
    permissions are not granted at install: click **Grant access** when prompted
    (same for the optional AI endpoint origin when saving options).
+
+## Permanent install in Firefox
+
+Temporary add-ons vanish on every restart. To keep the extension installed in
+release Firefox, produce a **Mozilla-signed, unlisted** `.xpi` (self-
+distribution — it stays private on AMO, it is not publicly listed):
+
+1. **Create AMO API credentials** (free Firefox Accounts login required):
+   open <https://addons.mozilla.org/developers/addon/api/key/>, accept the
+   Dev Edition agreement, and copy the *JWT issuer* and *JWT secret*.
+2. **Fill `.env`** at the repo root: copy `.env.example` to `.env` and paste
+   `WEB_EXT_API_KEY` (issuer, looks like `user:12345678:123`) and
+   `WEB_EXT_API_SECRET`. `.env` is gitignored; real environment variables of
+   the same name take precedence.
+3. **Sign:**
+
+   ```sh
+   cd extension && npm run sign:firefox
+   ```
+
+   This bumps the patch version in `extension/manifest.base.json` (AMO rejects
+   re-uploads of an existing version; use `--bump minor|major` or `--no-bump`
+   via `npm run sign:firefox -- --no-bump`), rebuilds, lints (aborts on
+   errors), and runs `web-ext sign --channel=unlisted`. Secrets are passed to
+   web-ext through the environment, never on a command line. `--dry-run` does
+   everything except upload.
+4. **Install:** find the `.xpi` in `web-ext-artifacts/` and open it in Firefox
+   (drag it into a window, or `about:addons` → gear → *Install Add-on From
+   File*).
+
+Because the signed build keeps the same gecko id
+(`reddit-scraper@lain.local`), installing the `.xpi` **replaces** a temporary
+add-on and keeps its settings and permissions. The native messaging host
+needs no change — the host manifest already allowlists that id.
 
 ## Load in Chrome / Chromium
 

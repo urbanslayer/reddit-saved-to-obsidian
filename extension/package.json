@@ -7,7 +7,8 @@
   "scripts": {
     "test": "node --test test/",
     "build": "node scripts/build.mjs",
-    "lint:firefox": "npx web-ext lint --source-dir dist/firefox"
+    "lint:firefox": "npx web-ext lint --source-dir dist/firefox",
+    "sign:firefox": "node ../scripts/sign-firefox.mjs"
   },
   "devDependencies": {
     "jsdom": "^26.1.0",

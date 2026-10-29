@@ -6,3 +6,8 @@ __pycache__/
 test-vault/Reddit/
 test-vault/.obsidian/workspace*.json
 web-ext-artifacts/
+
+# local secrets (AMO API credentials etc.) — keep .env.example tracked
+.env
+*.env
+!.env.example
