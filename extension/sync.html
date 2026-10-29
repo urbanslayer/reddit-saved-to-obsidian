@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Reddit Saved → Obsidian — Sync</title>
+  <link rel="stylesheet" href="src/shared.css">
+</head>
+<body>
+<main>
+  <h1>Sync saved items → Obsidian</h1>
+  <div class="kv">
+    <b>User</b><span id="who">—</span>
+    <b>Vault</b><span id="vault">—</span>
+  </div>
+  <div id="perm" class="status warn">
+    The extension needs access to old.reddit.com.
+    <button id="grantPerm">Grant access</button>
+  </div>
+  <div id="cfgWarn" class="status warn"></div>
+  <div class="row">
+    <button id="start" class="primary">Start sync</button>
+    <button id="cancel" disabled>Cancel</button>
+  </div>
+  <div class="progress"><div id="bar"></div></div>
+  <div id="log"></div>
+  <div id="final" class="status"></div>
+</main>
+<script type="module" src="sync.js"></script>
+</body>
+</html>

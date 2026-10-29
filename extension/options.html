@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Reddit Saved → Obsidian — Options</title>
+  <link rel="stylesheet" href="src/shared.css">
+</head>
+<body>
+<main>
+  <h1>Options</h1>
+
+  <h2>Reddit</h2>
+  <label for="username">Username <span class="hint">(the browser must be logged in to old.reddit.com as this user)</span></label>
+  <input type="text" id="username" placeholder="e.g. spezialoderino">
+
+  <h2>Obsidian vault (written via native host)</h2>
+  <label for="vaultPath">Vault path (absolute)</label>
+  <input type="text" id="vaultPath" placeholder="/home/you/vault">
+  <p class="hint">Dev test vault: /home/lain/Development/Reddit-Scraper/test-vault</p>
+  <label for="folder">Subfolder inside vault</label>
+  <input type="text" id="folder" placeholder="Reddit">
+  <div class="row">
+    <button id="testHost">Test native host</button>
+    <button id="testVault">Check vault</button>
+  </div>
+  <div id="hostStatus" class="status"></div>
+
+  <h2>Scraping</h2>
+  <label for="delayMs">Delay between requests (ms, min 1000)</label>
+  <input type="number" id="delayMs" min="1000" max="60000" step="500">
+  <label for="maxItems">Max items per sync</label>
+  <input type="number" id="maxItems" min="1" max="10000">
+  <label class="check"><input type="checkbox" id="incremental"> Stop at first already-saved item (incremental sync)</label>
+
+  <h2>AI summaries (optional, OpenAI-compatible endpoint)</h2>
+  <label class="check"><input type="checkbox" id="aiEnabled"> Enable AI summaries (images always; text optional)</label>
+  <label class="check"><input type="checkbox" id="aiForText"> Also use AI for text posts and comments</label>
+  <label for="aiEndpoint">Endpoint base URL (…/v1)</label>
+  <input type="text" id="aiEndpoint" placeholder="http://localhost:11434/v1">
+  <label for="aiModel">Model</label>
+  <input type="text" id="aiModel" placeholder="llava / gpt-4o-mini …">
+  <label for="aiApiKey">API key (optional)</label>
+  <input type="password" id="aiApiKey" autocomplete="off">
+  <p class="hint">Saving grants the endpoint origin if your browser requires it (Firefox asks for confirmation).</p>
+  <label class="check"><input type="checkbox" id="embedImages"> Embed image URLs in notes</label>
+
+  <div class="row">
+    <button id="save" class="primary">Save</button>
+  </div>
+  <div id="saveStatus" class="status"></div>
+</main>
+<script type="module" src="options.js"></script>
+</body>
+</html>
