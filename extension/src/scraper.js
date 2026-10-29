@@ -32,11 +32,106 @@ export class HttpError extends Error {
 }
 
 export const DEFAULTS = {
-  delayMs: 2000,
+  delayMs: 3000,
   minDelayMs: 1000,
   maxItems: 1000,
   incremental: true,
 };
+
+// Retry/pacing policy for Reddit rate limiting (all times in ms).
+export const RETRY_DEFAULTS = {
+  maxAttempts: 6,        // total attempts per request (fetch + retries)
+  baseBackoffMs: 60000,  // first backoff: 60 s, doubling each attempt
+  maxBackoffMs: 600000,  // exponential backoff cap: 10 min
+  maxWaitMs: 900000,     // cap for ANY single wait (incl. Retry-After): 15 min
+  maxDelayMs: 30000,     // adaptive inter-request delay cap
+};
+
+function headerValue(res, name) {
+  try {
+    const v = res?.headers?.get?.(name);
+    return v == null ? null : String(v);
+  } catch {
+    return null;
+  }
+}
+
+/** Retry-After header (delta-seconds or HTTP date) -> ms to wait, or null. */
+export function parseRetryAfterMs(value, nowMs = Date.now()) {
+  if (value == null || String(value).trim() === "") return null;
+  const secs = Number(value);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const dateMs = Date.parse(value);
+  if (Number.isFinite(dateMs)) return Math.max(0, dateMs - nowMs);
+  return null;
+}
+
+function backoffFor(attempt, retry) {
+  return Math.min(retry.baseBackoffMs * 2 ** (attempt - 1), retry.maxBackoffMs);
+}
+
+/** Is this HTTP status worth retrying? (429 rate limit, 5xx server errors.
+ *  403 is NOT retried — it usually means blocked/login, waiting won't help.) */
+export function isRetryableStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+/**
+ * One shared fetch helper for ALL Reddit requests (listing + detail pages).
+ * Retries 429 / 5xx / network errors with backoff; honours `Retry-After`
+ * (seconds or HTTP date) and `x-ratelimit-reset` (epoch seconds) when present.
+ * Waits are AbortSignal-cancellable and emit {type:'rateLimited', ...} events
+ * through onProgress so the UI can show a live countdown.
+ *
+ * Returns the response for `ok` and for non-retryable failures (403, 4xx…) —
+ * the caller decides what those mean. Throws HttpError when retryable attempts
+ * are exhausted, a plain Error when network errors are exhausted, and
+ * rethrows the abort reason immediately when the signal fires.
+ */
+export async function fetchResilient(fetchImpl, url, init, ctx) {
+  const {
+    retry = RETRY_DEFAULTS,
+    sleep,
+    signal,
+    now = () => Date.now(),
+    onProgress = () => {},
+    onRateLimited = () => {},
+  } = ctx;
+  for (let attempt = 1; attempt <= retry.maxAttempts; attempt++) {
+    if (signal?.aborted) throw signal.reason ?? new Error("aborted");
+    let res = null;
+    let netErr = null;
+    try {
+      res = await fetchImpl(url, { ...init, signal });
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      netErr = err;
+    }
+    if (!netErr && !isRetryableStatus(res.status)) return res;
+    if (attempt >= retry.maxAttempts) {
+      if (netErr) throw new Error(`Network error fetching ${url}: ${netErr.message}`);
+      throw new HttpError(res.status, url);
+    }
+    let waitMs = null;
+    if (!netErr) {
+      waitMs = parseRetryAfterMs(headerValue(res, "retry-after"), now());
+      if (waitMs == null) {
+        const reset = Number(headerValue(res, "x-ratelimit-reset"));
+        if (Number.isFinite(reset) && reset > 0) waitMs = Math.max(0, reset * 1000 - now());
+      }
+    }
+    if (waitMs == null || !Number.isFinite(waitMs)) waitMs = backoffFor(attempt, retry);
+    waitMs = Math.min(waitMs, retry.maxWaitMs);
+    const status = netErr ? 0 : res.status;
+    onProgress(
+      `${status ? `HTTP ${status}` : "network error"} fetching ${url} — retrying in ${Math.round(waitMs / 1000)} s ` +
+      `(attempt ${attempt + 1}/${retry.maxAttempts})`,
+      { type: "rateLimited", status, waitMs, attempt: attempt + 1, maxAttempts: retry.maxAttempts, url },
+    );
+    onRateLimited({ status, waitMs, attempt: attempt + 1, url });
+    await sleep(waitMs, signal);
+  }
+}
 
 const savedUrl = (username) =>
   `https://old.reddit.com/user/${encodeURIComponent(username)}/saved`;
@@ -94,12 +189,25 @@ export function finalizeItems(items, { embedImages = true } = {}) {
  * @param {number} [opts.delayMs] [opts.maxItems] [opts.incremental]
  * @param {boolean} [opts.embedImages] when false, every finished item's
  *   imageUrl is set to null (the host only embeds images when imageUrl is set)
+ * @param {string} [opts.startUrl] resume: first listing URL to fetch
+ *   (default: the saved page). Pair with startRank/startPage.
+ * @param {number} [opts.startRank] resume: global rank to start assigning (keeps ordering consistent)
+ * @param {number} [opts.startPage] resume: number of pages already written (batch page numbers continue from it)
+ * @param {boolean} [opts.skipKnown] resume mode: known ids are skipped (not
+ *   re-fetched/summarised/written) but still consume a rank, and never stop
+ *   the run. Without it, `incremental` means stop at the FIRST known id.
+ * @param {object} [opts.retry] overrides for RETRY_DEFAULTS (maxAttempts, baseBackoffMs, …)
+ * @param {() => number} [opts.now] clock (tests)
+ * @param {(data: object) => void} [opts.onRateLimited] called for every retryable failure before its wait
  * @param {AbortSignal} [opts.signal]
  * @param {(msg: string, data?: object) => void} [opts.onProgress]
  * @yields {object} progress events. Completion events:
- *   {type:'batch', page, items}  — one per listing page, emitted after that
- *     page's detail fetches + summaries, so callers can persist partial
- *     progress (same syncId across batches). Ranks are global listing indices.
+ *   {type:'rateLimited', status, waitMs, attempt, maxAttempts, url}
+ *     — emitted before every backoff wait so the UI can show a countdown.
+ *   {type:'batch', page, items, nextUrl, nextRank}  — one per listing page,
+ *     emitted after that page's detail fetches + summaries, so callers can
+ *     persist partial progress (same syncId across batches). Ranks are global
+ *     listing indices; nextUrl/nextRank describe where page+1 would resume.
  *   {type:'done', items, pages}  — all items of the run (concatenated batches).
  */
 export async function* scrapeSaved(opts) {
@@ -114,12 +222,20 @@ export async function* scrapeSaved(opts) {
     maxItems = DEFAULTS.maxItems,
     incremental = DEFAULTS.incremental,
     embedImages = true,
+    startUrl = null,
+    startRank = 0,
+    startPage = 0,
+    skipKnown = false,
+    retry = RETRY_DEFAULTS,
+    now = () => Date.now(),
+    onRateLimited = () => {},
     signal,
     onProgress = () => {},
   } = opts;
 
   if (!username) throw new Error("No Reddit username configured (set it in the extension options).");
-  const delay = Math.max(DEFAULTS.minDelayMs, Number(delayMs) || DEFAULTS.delayMs);
+  let currentDelay = Math.max(DEFAULTS.minDelayMs, Number(delayMs) || DEFAULTS.delayMs);
+  const stopAtKnown = incremental && !skipKnown; // resume mode: skip known, never stop
 
   const parser = new DOMParserImpl();
   const parseHtml = (html) => parser.parseFromString(html, "text/html");
@@ -138,9 +254,35 @@ export async function* scrapeSaved(opts) {
     if (signal?.aborted) throw signal.reason ?? new Error("aborted");
   };
 
-  let url = savedUrl(username);
-  let page = 0;
-  let rank = 0; // global listing index across pages (0 = newest)
+  // Adaptive pacing: any 429 doubles the inter-request delay for the rest of
+  // the run (capped); the retry wait itself also flows to the caller.
+  const noteRateLimited = ({ status }) => {
+    if (status === 429) currentDelay = Math.min(currentDelay * 2, retry.maxDelayMs ?? RETRY_DEFAULTS.maxDelayMs);
+  };
+  const resilient = (url, init) =>
+    fetchResilient(fetchImpl, url, init, {
+      retry: { ...RETRY_DEFAULTS, ...retry }, sleep, signal, now, onProgress,
+      onRateLimited: (d) => { noteRateLimited(d); onRateLimited(d); },
+    });
+
+  // Polite throttle: if Reddit reports the quota is nearly spent, sleep until
+  // the reset window before issuing the next request.
+  const throttleForRateHeaders = async (res, moreRequestsPending) => {
+    if (!moreRequestsPending) return;
+    const remaining = Number(headerValue(res, "x-ratelimit-remaining"));
+    const reset = Number(headerValue(res, "x-ratelimit-reset"));
+    if (!Number.isFinite(remaining) || !Number.isFinite(reset) || remaining >= 2) return;
+    const waitMs = Math.min(Math.max(0, reset * 1000 - now()), retry.maxWaitMs ?? RETRY_DEFAULTS.maxWaitMs);
+    if (waitMs <= 0) return;
+    onProgress(`rate limit nearly exhausted (${remaining} request(s) left); waiting ${Math.round(waitMs / 1000)} s until reset`, {
+      type: "rateLimitThrottle", waitMs, remaining, url: res.url,
+    });
+    await sleep(waitMs, signal);
+  };
+
+  let url = startUrl || savedUrl(username);
+  let page = Math.max(0, Math.floor(Number(startPage) || 0));
+  let rank = Math.max(0, Math.floor(Number(startRank) || 0)); // global listing index (0 = newest)
   const allItems = [];
   let stopEarly = false;
   let first = true;
@@ -148,32 +290,32 @@ export async function* scrapeSaved(opts) {
 
   while (url && !stopEarly && allItems.length < maxItems) {
     throwIfAborted();
-    if (!first) await sleep(delay, signal);
+    if (!first) await sleep(currentDelay, signal);
     first = false;
 
     page += 1;
     onProgress(`fetching page ${page}: ${url}`, { type: "fetchStart", page, url });
     let res;
     try {
-      res = await fetchImpl(url, { credentials: "include", redirect: "follow", signal });
+      res = await resilient(url, { credentials: "include", redirect: "follow" });
     } catch (err) {
       if (signal?.aborted) throw err;
+      if (err?.name === "HttpError") throw err; // exhausted retries: fail the run
       throw new Error(`Network error fetching ${url}: ${err.message}`);
     }
-    if (res.status === 429 || res.status === 403 || res.status >= 500 || !res.ok) {
-      throw new HttpError(res.status, url);
-    }
+    if (!res.ok) throw new HttpError(res.status, url); // 403/4xx: not retried
 
     const finalUrl = res.url || url;
     const html = await res.text();
     const doc = parseHtml(html);
     const parsed = parseListing(doc, finalUrl);
+    const nextUrl = parsed.nextUrl;
 
     if (parsed.isLoginWall) throw new LoginWallError(username, finalUrl);
     if (parsed.loggedInUser && parsed.loggedInUser.toLowerCase() !== username.toLowerCase()) {
       throw new UserMismatchError(username, parsed.loggedInUser);
     }
-    if (!parsed.loggedInUser && page === 1) {
+    if (!parsed.loggedInUser && page === Math.max(0, Math.floor(Number(startPage) || 0)) + 1) {
       onProgress("warning: could not confirm logged-in user on first page");
     }
 
@@ -183,6 +325,8 @@ export async function* scrapeSaved(opts) {
     });
     for (const iss of parsed.issues) onProgress(`parser notice: ${iss}`);
 
+    await throttleForRateHeaders(res, !!nextUrl);
+
     const pageItems = [];
     for (const item of parsed.items) {
       if (allItems.length + pageItems.length >= maxItems) {
@@ -190,10 +334,21 @@ export async function* scrapeSaved(opts) {
         stopEarly = true;
         break;
       }
-      if (incremental && known.has(item.id)) {
-        onProgress(`reached already-known item ${item.id}; stopping (incremental)`);
-        stopEarly = true;
-        break;
+      if (known.has(item.id)) {
+        if (stopAtKnown) {
+          // Correct for an up-to-date vault: even if this is the very first
+          // item of the run, everything below it is known too -> stop now.
+          onProgress(`reached already-known item ${item.id}; stopping (incremental)`);
+          stopEarly = true;
+          break;
+        }
+        if (skipKnown) {
+          onProgress(`skipping already-known item ${item.id} (resume; still consumes rank ${rank})`, {
+            type: "skipKnown", id: item.id, rank,
+          });
+          rank += 1;
+          continue;
+        }
       }
       item.rank = rank++;
       pageItems.push(item);
@@ -203,6 +358,9 @@ export async function* scrapeSaved(opts) {
     // Detail pages: text posts without inline selftext; galleries (first image).
     // Fetched from old.reddit.com (parsePostPage parses OLD reddit markup;
     // www.reddit.com serves the shreddit UI). item.permalink stays www.reddit.com.
+    // Detail 429/5xx/network failures go through the SAME retry/backoff helper
+    // so a rate-limited detail page pauses the run instead of hammering Reddit;
+    // exhausted retries fail the run (HttpError) rather than being skipped.
     const needDetail = pageItems.filter(
       (it) =>
         (it.postType === "text" && !it._bodyMarkdown) ||
@@ -217,11 +375,11 @@ export async function* scrapeSaved(opts) {
       throwIfAborted();
       if (!it.permalink || !/^https:\/\/(www\.)?reddit\.com\//.test(it.permalink)) continue;
       const detailUrl = toOldRedditUrl(it.permalink);
-      const wait = lastFetchAt ? delay - (Date.now() - lastFetchAt) : 0;
+      const wait = lastFetchAt ? currentDelay - (now() - lastFetchAt) : 0;
       if (wait > 0) await sleep(wait, signal);
       try {
-        const res = await fetchImpl(detailUrl, { credentials: "include", redirect: "follow", signal });
-        lastFetchAt = Date.now();
+        const res = await resilient(detailUrl, { credentials: "include", redirect: "follow" });
+        lastFetchAt = now();
         if (res.ok) {
           const doc = parseHtml(await res.text());
           const detail = parsePostPage(doc, res.url || detailUrl);
@@ -231,11 +389,13 @@ export async function* scrapeSaved(opts) {
           if (it.postType === "gallery" && !it.imageUrl && detail.imageUrls.length) {
             it.imageUrl = detail.imageUrls[0];
           }
-        } else if (res.status === 429 || res.status === 403) {
+          await throttleForRateHeaders(res, detailDone + 1 < needDetail.length || !!nextUrl);
+        } else {
           onProgress(`detail fetch for ${it.id} got HTTP ${res.status}; continuing without it`);
         }
       } catch (err) {
         if (signal?.aborted) throw err;
+        if (err?.name === "HttpError") throw err; // exhausted 429/5xx retries: fail the run
         onProgress(`detail fetch failed for ${it.id}: ${err.message}`);
       }
       detailDone += 1;
@@ -259,12 +419,13 @@ export async function* scrapeSaved(opts) {
     }
 
     // Finalise this page and hand it to the caller so partial progress is
-    // persisted even if a later page hits 429 / a cancel.
+    // persisted even if a later page hits 429 / a cancel. nextUrl/nextRank
+    // let the caller persist a resume cursor after each successful write.
     const batch = finalizeItems(pageItems, { embedImages });
     allItems.push(...batch);
-    if (batch.length) yield { type: "batch", page, items: batch };
+    if (batch.length) yield { type: "batch", page, items: batch, nextUrl, nextRank: rank };
 
-    url = parsed.nextUrl;
+    url = nextUrl;
   }
 
   yield { type: "done", items: allItems, pages: page };

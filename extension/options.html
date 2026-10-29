@@ -26,7 +26,7 @@
   <div id="hostStatus" class="status"></div>
 
   <h2>Scraping</h2>
-  <label for="delayMs">Delay between requests (ms, min 1000)</label>
+  <label for="delayMs">Delay between requests (ms, min 1000, default 3000 — doubles automatically after a rate limit)</label>
   <input type="number" id="delayMs" min="1000" max="60000" step="500">
   <label for="maxItems">Max items per sync</label>
   <input type="number" id="maxItems" min="1" max="10000">

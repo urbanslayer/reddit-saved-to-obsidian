@@ -51,7 +51,7 @@ npx web-ext lint --source-dir dist/firefox   # 0 errors expected
 
 `sync.html` (an extension page, so `DOMParser` and a long-lived context are
 available in both browsers) walks the saved listing via `span.next-button`
-pagination, ≥ 1 s (default 2 s) between requests, assigns `rank` (0 = newest
+pagination, ≥ 1 s (default 3 s) between requests, assigns `rank` (0 = newest
 saved, continuous across pages), stop-early on the first already-known id in
 incremental mode, fetches each page's detail pages (from **old.reddit.com** —
 `parsePostPage` parses old-reddit markup; permalinks stay www.reddit.com) only
@@ -64,15 +64,53 @@ report (counts, per-subreddit totals, added/updated) is accumulated per page.
 Errors (429/403/5xx, login wall, user mismatch) and how many items were
 already written are shown in the page log; Cancel aborts via `AbortSignal`.
 
+## Rate limits (429) and retries
+
+Every Reddit request (listing **and** detail pages) goes through one shared
+fetch helper (`src/scraper.js → fetchResilient`):
+
+- **429 / 5xx / network errors are retried**: it honours `Retry-After`
+  (delta-seconds or HTTP date) and `x-ratelimit-reset` (epoch seconds) when
+  present; otherwise exponential backoff starting at 60 s, doubling, capped at
+  10 min, **6 attempts total** (configurable). Any single wait is capped at
+  15 min. After the final failed attempt the run fails with `HttpError`.
+- **403 is never retried** (usually blocked/logged-out — waiting won't help).
+- Waits are `AbortSignal`-cancellable (Cancel works mid-wait) and show a live
+  countdown on the sync page: *Rate limited — retrying in 1:23 (attempt 2/6)*.
+- **Adaptive pacing**: after any 429 the inter-request delay is doubled for
+  the rest of the run (cap 30 s). If a response reports
+  `x-ratelimit-remaining < 2` with `x-ratelimit-reset`, the sync sleeps until
+  the reset window before its next request.
+
+## Resume
+
+After **each page's batch is written** to the vault, the sync page stores a
+resume cursor in `storage.local` (`src/resume.js`): username, vaultPath,
+folder, syncId, `nextUrl`, `nextRank`, page, items written. If a run later
+dies (429 retries exhausted, cancel, closed tab), reopening the sync page
+shows *Previous sync stopped at page N (X items written) — [Resume] [Start
+over]*:
+
+- **Resume** continues at the stored URL with the **same syncId and rank**, so
+  vault ordering stays consistent. Already-known items are *skipped* (not
+  re-fetched/summarised/written) but still consume a rank; the incremental
+  "stop at first known" rule is disabled during a resumed run.
+- **Start over** discards the cursor and runs a normal (incremental) sync.
+- A sync that completes normally clears the cursor.
+
+Note: in a normal incremental sync an already-known *first* item still stops
+the run immediately — correct for an up-to-date vault.
+
 ## Layout
 
 - `manifest.base.json` → per-browser manifests via `scripts/build.mjs`
 - `src/parser.js` old.reddit HTML → items (tolerant; collects unparseable things as issues)
-- `src/scraper.js` async generator: pagination, politeness, incremental stop, enrichment
+- `src/scraper.js` async generator: pagination, politeness, incremental stop, enrichment, 429/5xx retry+backoff (shared `fetchResilient`), adaptive pacing, resume (`startUrl`/`startRank`/`skipKnown`)
 - `src/summarize.js` local extractive summariser + optional AI with fallback
 - `src/native.js` native-messaging contract wrapper (ping/checkVault/getKnownIds/writeItems)
+- `src/resume.js` pure resume-cursor helpers (save/load/clear/match) over a storage adapter
 - `src/settings.js` storage-backed settings with defaults
-- `test/` `node --test` + jsdom fixtures (synthetic old.reddit pages + a real login-wall capture)
+- `test/` `node --test` + jsdom fixtures (synthetic old.reddit pages + a real login-wall capture); `rate-limit-resume.test.mjs` covers retry/backoff/pacing/resume with mocked fetch+sleep
 
 ## Known limitations
 

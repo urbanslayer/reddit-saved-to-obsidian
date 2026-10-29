@@ -10,7 +10,9 @@ vault, inside a dedicated folder (default `Reddit`), one note per subreddit, new
   `https://old.reddit.com/user/<username>/saved` HTML using the browser's existing logged-in
   session cookies and parses it with `DOMParser`. Pagination via the `next ›` link (`?count=N&after=t3_xxx`).
   Saved items are private: the browser must be logged in as `<username>`; detect and report a mismatch.
-- **Polite**: ≥ 2 s between requests (configurable, min 1 s), sequential, stop on 429/403 with a clear error.
+- **Polite**: ≥ 1 s between requests (configurable, default 3 s, min 1 s), sequential.
+  429/5xx/network errors are retried with backoff (see *Rate limits & retry*);
+  403 fails immediately (likely blocked/login).
 - **Ordering**: Reddit does not expose save time, but the saved listing is ordered most-recently-saved
   first. Each item carries its `rank` in the listing (0 = newest). The host assigns a persistent
   `order = [firstSeenSyncId, rank]`; notes sort by `firstSeenSyncId` desc, then `rank` asc.
@@ -114,3 +116,52 @@ tags: [reddit, reddit/Python]
 ```
 Notes are regenerated from `state.json` on each write; only the `## My notes` tail is preserved.
 Re-sending a known id updates its fields (summary etc.) but keeps its order key.
+
+## Rate limits & retry (`src/scraper.js`)
+
+Every Reddit request — listing pages *and* detail pages — goes through one
+shared helper, `fetchResilient(fetchImpl, url, init, ctx)`:
+
+- **Retryable**: HTTP 429, HTTP 5xx, network errors. **Not retried**: 403
+  (blocked/login — waiting doesn't help) and other 4xx; the caller turns those
+  into `HttpError` (listing) or logs and continues (detail page).
+- **Wait computation** (first match wins): `Retry-After` response header
+  (delta-seconds or HTTP date), else `x-ratelimit-reset` (epoch seconds,
+  wait until then), else exponential backoff 60 s, doubling per attempt,
+  capped at 10 min. Any *single* wait is capped at 15 min.
+  Default policy: `maxAttempts: 6` (configurable via `opts.retry`).
+- After the final failed attempt: throw `HttpError` (or a network `Error`),
+  failing the run — but every already-written page stays in the vault.
+- Waits use the injectable `sleep(ms, signal)`, so they are
+  AbortSignal-cancellable (Cancel works mid-wait) and mockable in tests.
+- Before each wait the scraper emits a progress event
+  `{type:'rateLimited', status, waitMs, attempt, maxAttempts, url}`; the sync
+  page renders it as a live countdown (*Rate limited — retrying in 1:23
+  (attempt 2/6)*).
+- **Adaptive pacing**: any 429 doubles the inter-request delay for the rest of
+  the run (cap 30 s). Additionally, when a response carries
+  `x-ratelimit-remaining` < 2 together with `x-ratelimit-reset`, the scraper
+  sleeps until the reset window before issuing its next request.
+  Default inter-request delay raised from 2000 ms to 3000 ms.
+- Detail-page 429s back off through the same helper; exhausted retries fail
+  the run rather than silently skipping (silently skipping made later pages
+  keep hammering Reddit while rate-limited).
+
+## Resumable syncs (`src/resume.js` + sync page)
+
+Batches are written per listing page; after each *successful* write the sync
+page persists a cursor in `storage.local` (key `resumeCursor`):
+`{username, vaultPath, folder, syncId, nextUrl, nextRank, page, itemsWritten, updatedAt}`.
+
+- On sync-page load, a cursor matching the current username/vaultPath/folder
+  shows: *Previous sync stopped at page N (X items written) — [Resume] [Start over]*.
+- **Resume** calls `scrapeSaved` with `startUrl = nextUrl`, `startRank =
+  nextRank`, `startPage = page`, the **same syncId**, and `skipKnown = true`:
+  known ids are skipped (not fetched/summarised/written) but still consume a
+  rank — keeping ordering consistent with the host's `order` key — and never
+  stop the run (the incremental stop-at-first-known rule is disabled).
+- **Start over** clears the cursor and runs normally.
+- A normal completion (no pending `nextUrl`) clears the cursor.
+- In a normal incremental run, the first item already being known stops
+  immediately — correct behaviour for an up-to-date vault.
+- `src/resume.js` is pure (storage adapter injected) and unit-tested.

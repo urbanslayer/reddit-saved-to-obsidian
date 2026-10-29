@@ -5,7 +5,7 @@ export const DEFAULTS = {
   username: "",
   vaultPath: "",
   folder: "Reddit",
-  delayMs: 2000,
+  delayMs: 3000,
   maxItems: 1000,
   incremental: true,
   aiEnabled: false,
@@ -39,7 +39,7 @@ export function sanitize(s) {
   out.username = String(out.username || "").trim().replace(/^u\//, "").replace(/^\/+|\/+$/g, "");
   out.vaultPath = String(out.vaultPath || "").trim();
   out.folder = String(out.folder || "Reddit").trim().replace(/^\/+|\/+$/g, "") || "Reddit";
-  out.delayMs = Math.max(1000, Math.min(60000, Number(out.delayMs) || 2000));
+  out.delayMs = Math.max(1000, Math.min(60000, Number(out.delayMs) || 3000));
   out.maxItems = Math.max(1, Math.min(10000, Math.floor(Number(out.maxItems) || 1000)));
   out.incremental = !!out.incremental;
   out.aiEnabled = !!out.aiEnabled;
