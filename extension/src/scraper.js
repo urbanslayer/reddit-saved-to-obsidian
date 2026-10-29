@@ -41,6 +41,24 @@ export const DEFAULTS = {
 const savedUrl = (username) =>
   `https://old.reddit.com/user/${encodeURIComponent(username)}/saved`;
 
+/**
+ * Detail pages must be fetched from old.reddit.com: parsePostPage() parses
+ * OLD reddit markup (.expando .usertext-body .md, .media-gallery, …), while
+ * the new 'shreddit' UI served at www.reddit.com does not contain it.
+ * item.permalink itself stays www.reddit.com in the output.
+ */
+export function toOldRedditUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname === "www.reddit.com" || u.hostname === "reddit.com") {
+      u.hostname = "old.reddit.com";
+    }
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
 function defaultSleep(ms, signal) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
@@ -49,6 +67,18 @@ function defaultSleep(ms, signal) {
       signal.addEventListener("abort", () => { clearTimeout(t); reject(signal.reason ?? new Error("aborted")); }, { once: true });
     }
   });
+}
+
+/**
+ * Finalise raw parser items into host Items (strips internal fields).
+ * When embedImages === false, EVERY item's imageUrl is cleared — the host
+ * only embeds an image when imageUrl is set, so this turns embedding off
+ * for image posts too, not just non-image posts.
+ */
+export function finalizeItems(items, { embedImages = true } = {}) {
+  return items.map((it) =>
+    embedImages === false ? toItem(it, { imageUrl: null }) : toItem(it)
+  );
 }
 
 /**
@@ -62,9 +92,15 @@ function defaultSleep(ms, signal) {
  * @param {(items: object[], ctx: object) => Promise<void>} [opts.summariseAll] mutate items in place (attach summary/summarySource/imageUrl)
  * @param {() => Promise<Set<string>>|Set<string>} [opts.getKnownIds]
  * @param {number} [opts.delayMs] [opts.maxItems] [opts.incremental]
+ * @param {boolean} [opts.embedImages] when false, every finished item's
+ *   imageUrl is set to null (the host only embeds images when imageUrl is set)
  * @param {AbortSignal} [opts.signal]
  * @param {(msg: string, data?: object) => void} [opts.onProgress]
- * @yields {object} progress events {type: 'page'|'pageParsed'|'fetchStart'|'item'|'done', ...}
+ * @yields {object} progress events. Completion events:
+ *   {type:'batch', page, items}  — one per listing page, emitted after that
+ *     page's detail fetches + summaries, so callers can persist partial
+ *     progress (same syncId across batches). Ranks are global listing indices.
+ *   {type:'done', items, pages}  — all items of the run (concatenated batches).
  */
 export async function* scrapeSaved(opts) {
   const {
@@ -77,6 +113,7 @@ export async function* scrapeSaved(opts) {
     delayMs = DEFAULTS.delayMs,
     maxItems = DEFAULTS.maxItems,
     incremental = DEFAULTS.incremental,
+    embedImages = true,
     signal,
     onProgress = () => {},
   } = opts;
@@ -103,12 +140,13 @@ export async function* scrapeSaved(opts) {
 
   let url = savedUrl(username);
   let page = 0;
-  let rank = 0;
-  const collected = [];
+  let rank = 0; // global listing index across pages (0 = newest)
+  const allItems = [];
   let stopEarly = false;
   let first = true;
+  let lastFetchAt = 0; // polite pacing across ALL detail fetches
 
-  while (url && !stopEarly && collected.length < maxItems) {
+  while (url && !stopEarly && allItems.length < maxItems) {
     throwIfAborted();
     if (!first) await sleep(delay, signal);
     first = false;
@@ -145,8 +183,9 @@ export async function* scrapeSaved(opts) {
     });
     for (const iss of parsed.issues) onProgress(`parser notice: ${iss}`);
 
+    const pageItems = [];
     for (const item of parsed.items) {
-      if (collected.length >= maxItems) {
+      if (allItems.length + pageItems.length >= maxItems) {
         onProgress(`reached maxItems=${maxItems}, stopping`);
         stopEarly = true;
         break;
@@ -157,64 +196,76 @@ export async function* scrapeSaved(opts) {
         break;
       }
       item.rank = rank++;
-      collected.push(item);
-      yield { type: "item", item, page };
+      pageItems.push(item);
     }
+
+    // --- per-page enrichment pass ----------------------------------------
+    // Detail pages: text posts without inline selftext; galleries (first image).
+    // Fetched from old.reddit.com (parsePostPage parses OLD reddit markup;
+    // www.reddit.com serves the shreddit UI). item.permalink stays www.reddit.com.
+    const needDetail = pageItems.filter(
+      (it) =>
+        (it.postType === "text" && !it._bodyMarkdown) ||
+        (it.postType === "gallery" && !it.imageUrl)
+    );
+    onProgress(`page ${page}: fetching ${needDetail.length} detail page(s)`, {
+      type: "detailStart", page, count: needDetail.length,
+    });
+
+    let detailDone = 0;
+    for (const it of needDetail) {
+      throwIfAborted();
+      if (!it.permalink || !/^https:\/\/(www\.)?reddit\.com\//.test(it.permalink)) continue;
+      const detailUrl = toOldRedditUrl(it.permalink);
+      const wait = lastFetchAt ? delay - (Date.now() - lastFetchAt) : 0;
+      if (wait > 0) await sleep(wait, signal);
+      try {
+        const res = await fetchImpl(detailUrl, { credentials: "include", redirect: "follow", signal });
+        lastFetchAt = Date.now();
+        if (res.ok) {
+          const doc = parseHtml(await res.text());
+          const detail = parsePostPage(doc, res.url || detailUrl);
+          if (it.postType === "text" && !it._bodyMarkdown && detail.selftextMarkdown) {
+            it._bodyMarkdown = detail.selftextMarkdown;
+          }
+          if (it.postType === "gallery" && !it.imageUrl && detail.imageUrls.length) {
+            it.imageUrl = detail.imageUrls[0];
+          }
+        } else if (res.status === 429 || res.status === 403) {
+          onProgress(`detail fetch for ${it.id} got HTTP ${res.status}; continuing without it`);
+        }
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        onProgress(`detail fetch failed for ${it.id}: ${err.message}`);
+      }
+      detailDone += 1;
+      onProgress(`detail pages (page ${page}): ${detailDone}/${needDetail.length}`, { type: "detailProgress", page, done: detailDone, total: needDetail.length });
+    }
+
+    // --- per-page summarise pass ------------------------------------------
+    if (pageItems.length) {
+      onProgress(`page ${page}: summarising ${pageItems.length} item(s)`, {
+        type: "summariseStart", page, total: pageItems.length,
+      });
+      let sumDone = 0;
+      const CHUNK = 25;
+      for (let i = 0; i < pageItems.length; i += CHUNK) {
+        throwIfAborted();
+        const chunk = pageItems.slice(i, i + CHUNK);
+        await summariseAll(chunk, { username, signal, onProgress });
+        sumDone += chunk.length;
+        onProgress(`page ${page}: summarising ${sumDone}/${pageItems.length}`, { type: "summariseProgress", page, done: sumDone, total: pageItems.length });
+      }
+    }
+
+    // Finalise this page and hand it to the caller so partial progress is
+    // persisted even if a later page hits 429 / a cancel.
+    const batch = finalizeItems(pageItems, { embedImages });
+    allItems.push(...batch);
+    if (batch.length) yield { type: "batch", page, items: batch };
 
     url = parsed.nextUrl;
   }
 
-  // --- enrichment pass -------------------------------------------------
-  // Detail pages: text posts without inline selftext; galleries (first image).
-  const needDetail = collected.filter(
-    (it) =>
-      (it.postType === "text" && !it._bodyMarkdown) ||
-      (it.postType === "gallery" && !it.imageUrl)
-  );
-  onProgress(`fetching ${needDetail.length} detail page(s)`, { type: "detailStart", count: needDetail.length });
-
-  let detailDone = 0;
-  let lastFetchAt = 0;
-  for (const it of needDetail) {
-    throwIfAborted();
-    if (!it.permalink || !/^https:\/\/www\.reddit\.com\//.test(it.permalink)) continue;
-    const wait = lastFetchAt ? delay - (Date.now() - lastFetchAt) : 0;
-    if (wait > 0) await sleep(wait, signal);
-    try {
-      const res = await fetchImpl(it.permalink, { credentials: "include", redirect: "follow", signal });
-      lastFetchAt = Date.now();
-      if (res.ok) {
-        const doc = parseHtml(await res.text());
-        const detail = parsePostPage(doc, res.url || it.permalink);
-        if (it.postType === "text" && !it._bodyMarkdown && detail.selftextMarkdown) {
-          it._bodyMarkdown = detail.selftextMarkdown;
-        }
-        if (it.postType === "gallery" && !it.imageUrl && detail.imageUrls.length) {
-          it.imageUrl = detail.imageUrls[0];
-        }
-      } else if (res.status === 429 || res.status === 403) {
-        onProgress(`detail fetch for ${it.id} got HTTP ${res.status}; continuing without it`);
-      }
-    } catch (err) {
-      if (signal?.aborted) throw err;
-      onProgress(`detail fetch failed for ${it.id}: ${err.message}`);
-    }
-    detailDone += 1;
-    onProgress(`detail pages: ${detailDone}/${needDetail.length}`, { type: "detailProgress", done: detailDone, total: needDetail.length });
-  }
-
-  // --- summarise pass ---------------------------------------------------
-  onProgress(`summarising ${collected.length} item(s)`, { type: "summariseStart", total: collected.length });
-  let sumDone = 0;
-  const CHUNK = 25;
-  for (let i = 0; i < collected.length; i += CHUNK) {
-    throwIfAborted();
-    const chunk = collected.slice(i, i + CHUNK);
-    await summariseAll(chunk, { username, signal, onProgress });
-    sumDone += chunk.length;
-    onProgress(`summarising ${sumDone}/${collected.length}`, { type: "summariseProgress", done: sumDone, total: collected.length });
-  }
-
-  const items = collected.map((it) => toItem(it));
-  yield { type: "done", items, pages: page };
+  yield { type: "done", items: allItems, pages: page };
 }

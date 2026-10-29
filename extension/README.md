@@ -52,13 +52,17 @@ npx web-ext lint --source-dir dist/firefox   # 0 errors expected
 `sync.html` (an extension page, so `DOMParser` and a long-lived context are
 available in both browsers) walks the saved listing via `span.next-button`
 pagination, ≥ 1 s (default 2 s) between requests, assigns `rank` (0 = newest
-saved), stop-early on the first already-known id in incremental mode,
-fetches detail pages only for text posts lacking inline selftext and galleries
-(first image), summarises locally (or via an optional OpenAI-compatible
-endpoint incl. vision), then sends `writeItems` batches of ≤ 50 to the native
-host with one shared `syncId`. Progress, per-subreddit counts, and errors
-(429/403/5xx, login wall, user mismatch) are shown in the page log; Cancel
-aborts via `AbortSignal`.
+saved, continuous across pages), stop-early on the first already-known id in
+incremental mode, fetches each page's detail pages (from **old.reddit.com** —
+`parsePostPage` parses old-reddit markup; permalinks stay www.reddit.com) only
+for text posts lacking inline selftext and galleries (first image), and
+summarises locally (or via an optional OpenAI-compatible endpoint incl.
+vision). Each listing page is then sent to the native host as `writeItems`
+batches of ≤ 50 **immediately** (one shared `syncId` for the whole run), so a
+429 or a Cancel on a later page keeps everything already written; the final
+report (counts, per-subreddit totals, added/updated) is accumulated per page.
+Errors (429/403/5xx, login wall, user mismatch) and how many items were
+already written are shown in the page log; Cancel aborts via `AbortSignal`.
 
 ## Layout
 

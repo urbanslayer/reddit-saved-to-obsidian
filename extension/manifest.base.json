@@ -10,11 +10,6 @@
     "https://i.redd.it/*",
     "https://preview.redd.it/*"
   ],
-  "optional_permissions": [
-    "http://localhost/*",
-    "http://127.0.0.1/*",
-    "https://*/*"
-  ],
   "optional_host_permissions": [
     "http://localhost/*",
     "http://127.0.0.1/*",

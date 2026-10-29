@@ -55,7 +55,10 @@ Every response has `ok: boolean`; on failure `error: string`.
 - `vaultPath` must be absolute and exist; `folder` is a single relative path segment-safe name
   (may contain `/` for nesting but no `..`, no absolute paths). All writes stay under `vaultPath/folder`.
 - `syncId`: ISO-8601 UTC timestamp of when the sync started (same for all batches of one sync).
-- Extension sends items in batches (≤ 50 per message).
+- Extension sends items in batches (≤ 50 per message). Items are flushed per
+  listing page (each page's batch written right after its detail enrichment +
+  summaries), so a mid-run 429/cancel keeps partial progress under the same
+  `syncId`; `rank` stays the global listing index across pages.
 
 ### Item
 ```json

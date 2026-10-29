@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { JSDOM } from "jsdom";
-import { scrapeSaved, LoginWallError, UserMismatchError, HttpError } from "../src/scraper.js";
+import { scrapeSaved, finalizeItems, toOldRedditUrl, LoginWallError, UserMismatchError, HttpError } from "../src/scraper.js";
+import { REQUIRED_ORIGINS } from "../src/origins.js";
 import { applyLocal } from "../src/summarize.js";
 import { validateItem } from "./schema.js";
 
@@ -34,13 +35,19 @@ const DOMParserImpl = jsdomWindow.DOMParser;
 const noSleep = async () => {};
 const summariseLocal = async (items) => items.forEach(applyLocal);
 
+const D1 = "https://old.reddit.com/r/LocalLLaMA/comments/txt011/quantization-notes/";
+const D2 = "https://old.reddit.com/r/wallpapers/comments/gal012/aurora-set/";
+const D3 = "https://old.reddit.com/r/wallpapers/comments/gal003/cozy-set/";
+
 function baseRoutes(extra = []) {
   return [
     [P1, { status: 200, body: fix("saved_page1.html") }],
     [P2, { status: 200, body: fix("saved_page2.html") }],
-    ["https://www.reddit.com/r/LocalLLaMA/comments/txt011/quantization-notes/", { status: 200, body: fix("post_selftext.html") }],
-    ["https://www.reddit.com/r/wallpapers/comments/gal012/aurora-set/", { status: 200, body: fix("post_gallery.html") }],
-    ["https://www.reddit.com/r/wallpapers/comments/gal003/cozy-set/", { status: 200, body: fix("post_gallery.html") }],
+    // detail pages are served at their old.reddit.com URLs (the scraper must
+    // fetch old.reddit.com, not www.reddit.com, for parsePostPage to work).
+    [D1, { status: 200, body: fix("post_selftext.html") }],
+    [D2, { status: 200, body: fix("post_gallery.html") }],
+    [D3, { status: 200, body: fix("post_gallery.html") }],
     ...extra,
   ];
 }
@@ -48,6 +55,7 @@ function baseRoutes(extra = []) {
 async function runScrape(opts = {}) {
   const calls = [];
   const events = [];
+  const batches = [];
   const gen = scrapeSaved({
     username: "testuser",
     fetchImpl: mockFetch(baseRoutes(opts.routes || []), calls),
@@ -61,8 +69,9 @@ async function runScrape(opts = {}) {
   for await (const ev of gen) {
     events.push(ev);
     if (ev.type === "done") done = ev;
+    if (ev.type === "batch") batches.push(ev);
   }
-  return { items: done.items, events, calls };
+  return { items: done.items, events, calls, batches, done };
 }
 
 test("scraper: paginates, ranks, enriches detail pages, items validate against DESIGN schema", async () => {
@@ -80,7 +89,7 @@ test("scraper: paginates, ranks, enriches detail pages, items validate against D
   assert.equal(txt011.postType, "text");
   assert.match(txt011.summary, /q4_k_m loses coherence/);
   assert.equal(txt011.summarySource, "selftext");
-  assert.ok(calls.includes("https://www.reddit.com/r/LocalLLaMA/comments/txt011/quantization-notes/"));
+  assert.ok(calls.includes(D1));
 
   // gallery got first image from detail page
   const gal012 = items.find((i) => i.id === "t3_gal012");
@@ -191,4 +200,107 @@ test("scraper: missing username errors clearly", async () => {
   await assert.rejects((async () => {
     for await (const _ of scrapeSaved({ username: "", fetchImpl: mockFetch([]), DOMParserImpl, sleep: noSleep })) void _;
   })(), /username/);
+});
+
+// --- review fixes ---------------------------------------------------------
+
+test("scraper: detail fetches use old.reddit.com; item.permalink stays www.reddit.com", async () => {
+  const { items, calls } = await runScrape();
+  const detailCalls = calls.filter((u) => u.includes("/comments/"));
+  assert.ok(detailCalls.length >= 3, `expected several detail fetches, got ${detailCalls.length}`);
+  for (const u of detailCalls) {
+    assert.ok(u.startsWith("https://old.reddit.com/"), `detail fetch must use old.reddit.com: ${u}`);
+    assert.ok(!u.includes("www.reddit.com"), `detail fetch hit www.reddit.com (shreddit UI): ${u}`);
+  }
+  // permalinks in the output remain www.reddit.com
+  for (const it of items) {
+    assert.match(it.permalink, /^https:\/\/www\.reddit\.com\//);
+  }
+  // selftext really came from the old-reddit detail fixture
+  const txt011 = items.find((i) => i.id === "t3_txt011");
+  assert.match(txt011.summary, /q4_k_m loses coherence/);
+  // toOldRedditUrl keeps path/query intact
+  assert.equal(
+    toOldRedditUrl("https://www.reddit.com/r/x/comments/abc/slug/?context=3"),
+    "https://old.reddit.com/r/x/comments/abc/slug/?context=3",
+  );
+});
+
+test("scraper: yields one batch per listing page with globally continuous ranks", async () => {
+  const { batches, items } = await runScrape();
+  assert.equal(batches.length, 2, "one batch per listing page");
+  assert.deepEqual(batches.map((b) => b.page), [1, 2]);
+  const page1Ids = ["t3_txt001", "t3_img002", "t3_gal003", "t3_vid004", "t3_lnk005", "t1_com006", "t3_prf007"];
+  assert.deepEqual(batches[0].items.map((i) => i.id), page1Ids);
+  assert.deepEqual(batches[0].items.map((i) => i.rank), [0, 1, 2, 3, 4, 5, 6]);
+  // ranks continue across pages (7..11), they do not restart at 0
+  assert.deepEqual(batches[1].items.map((i) => i.rank), [7, 8, 9, 10, 11]);
+  assert.deepEqual(items, batches[0].items.concat(batches[1].items));
+  for (const b of batches) for (const it of b.items) {
+    assert.deepEqual(validateItem(it), [], `schema violations for ${it.id}`);
+  }
+});
+
+test("scraper: HTTP error on page 2 still yields page 1 batch (partial progress survives)", async () => {
+  const calls = [];
+  const events = [];
+  const routes = baseRoutes([[P2, { status: 429, body: "too many requests" }]]);
+  // put the failing route first so it wins over the healthy base route
+  routes.unshift([P2, { status: 429, body: "too many requests" }]);
+  let err;
+  let page1Batch;
+  try {
+    for await (const ev of scrapeSaved({
+      username: "testuser",
+      fetchImpl: mockFetch(routes, calls),
+      DOMParserImpl, sleep: noSleep, summariseAll: summariseLocal, delayMs: 0,
+    })) {
+      events.push(ev.type);
+      if (ev.type === "batch" && ev.page === 1) page1Batch = ev;
+    }
+  } catch (e) {
+    err = e;
+  }
+  assert.ok(err instanceof HttpError && /429/.test(err.message), `expected HttpError, got ${err}`);
+  assert.ok(page1Batch, "page 1 batch must be yielded before page 2 fails");
+  assert.equal(page1Batch.items.length, 7);
+  // enrichment for page 1 happened (gal003 gallery image came from its detail page)
+  assert.equal(page1Batch.items.find((i) => i.id === "t3_gal003").imageUrl, "https://i.redd.it/aur1.jpg");
+});
+
+test("scraper: embedImages=false sets imageUrl null on ALL items (incl. image posts)", async () => {
+  const { items, batches } = await runScrape({ embedImages: false });
+  const img = items.find((i) => i.id === "t3_img002");
+  assert.equal(img.postType, "image");
+  assert.equal(img.imageUrl, null, "image posts must also be null when embedding is off");
+  const gal = items.find((i) => i.id === "t3_gal012");
+  assert.equal(gal.imageUrl, null);
+  for (const it of items) assert.equal(it.imageUrl, null);
+  assert.ok(batches.length === 2, "batching unaffected");
+  // summaries still work
+  assert.match(img.summary, /^Image post: Sunset over the mountains/);
+});
+
+test("finalizeItems: pure helper — embedImages default keeps imageUrl, false clears it", () => {
+  const raw = [
+    { id: "t3_a", kind: "post", subreddit: "x", title: "a", permalink: "https://www.reddit.com/x/", url: null, author: null, createdUtc: 1, postType: "image", summary: "", summarySource: "image-fallback", imageUrl: "https://i.redd.it/a.jpg", nsfw: false, rank: 0, _bodyMarkdown: "hidden" },
+  ];
+  const on = finalizeItems(raw);
+  assert.equal(on[0].imageUrl, "https://i.redd.it/a.jpg");
+  assert.equal("_bodyMarkdown" in on[0], false, "internal fields stripped");
+  const off = finalizeItems(raw, { embedImages: false });
+  assert.equal(off[0].imageUrl, null);
+  // input untouched (pure)
+  assert.equal(raw[0].imageUrl, "https://i.redd.it/a.jpg");
+});
+
+test("origins: REQUIRED_ORIGINS covers every host the sync needs", () => {
+  for (const o of [
+    "https://old.reddit.com/*",
+    "https://www.reddit.com/*",
+    "https://i.redd.it/*",
+    "https://preview.redd.it/*",
+  ]) {
+    assert.ok(REQUIRED_ORIGINS.includes(o), `missing origin ${o}`);
+  }
 });

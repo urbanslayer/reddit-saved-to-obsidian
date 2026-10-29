@@ -1,7 +1,8 @@
 import { api } from "./src/compat.js";
 import { loadSettings } from "./src/settings.js";
-import { scrapeSaved, LoginWallError, UserMismatchError, HttpError } from "./src/scraper.js";
+import { scrapeSaved } from "./src/scraper.js";
 import { summariseAll } from "./src/summarize.js";
+import { REQUIRED_ORIGINS } from "./src/origins.js";
 import * as native from "./src/native.js";
 
 const $ = (id) => document.getElementById(id);
@@ -29,9 +30,10 @@ if (!settings.vaultPath) missing.push("vault path");
 if (missing.length) setStatus($("cfgWarn"), "warn", `Missing setting(s): ${missing.join(", ")} — open Options first.`);
 
 // --- host permission gate (Firefox grants host perms only on request) ---
+// Check/request every origin the scrape + image embedding needs at once.
 async function hasRedditAccess() {
   try {
-    return await api.permissions.contains({ origins: ["https://old.reddit.com/*"] });
+    return await api.permissions.contains({ origins: REQUIRED_ORIGINS });
   } catch { return true; }
 }
 async function refreshPerm() {
@@ -40,7 +42,7 @@ async function refreshPerm() {
 }
 $("grantPerm").addEventListener("click", async () => {
   try {
-    await api.permissions.request({ origins: ["https://old.reddit.com/*"] });
+    await api.permissions.request({ origins: REQUIRED_ORIGINS });
   } catch (err) {
     log(`permission request failed: ${err.message}`);
   }
@@ -64,13 +66,18 @@ $("start").addEventListener("click", async () => {
   t0 = Date.now();
 
   const syncId = new Date().toISOString();
-  let items = [];
+  // Running totals: items are written to the vault page-by-page (per scraper
+  // 'batch' event, same syncId), so a 429/cancel later keeps partial progress.
+  let scraped = 0;
+  let added = 0;
+  let updated = 0;
+  const bySub = {};
   try {
     if (!settings.username || !settings.vaultPath) {
       throw new Error(`Configure ${[!settings.username && "username", !settings.vaultPath && "vault path"].filter(Boolean).join(" and ")} in Options first.`);
     }
     if (!(await hasRedditAccess())) {
-      throw new Error("old.reddit.com access not granted — click 'Grant access' above.");
+      throw new Error("Reddit access not granted — click 'Grant access' above.");
     }
 
     log(`sync ${syncId} · u/${settings.username} → ${settings.vaultPath}/${settings.folder}`);
@@ -86,6 +93,7 @@ $("start").addEventListener("click", async () => {
       delayMs: settings.delayMs,
       maxItems: settings.maxItems,
       incremental: settings.incremental,
+      embedImages: settings.embedImages,
       getKnownIds: () => knownIds,
       signal: controller?.signal,
       summariseAll: (chunk, ctx) => summariseAll(chunk, {
@@ -95,44 +103,46 @@ $("start").addEventListener("click", async () => {
       onProgress: (msg, data) => {
         log(msg, data);
         if (data?.type === "summariseProgress") {
-          $("bar").style.width = `${Math.round((data.done / Math.max(1, data.total)) * 80) + 10}%`;
+          $("bar").style.width = `${10 + Math.round((data.done / Math.max(1, data.total)) * 50)}%`;
         }
       },
     })) {
-      if (ev.type === "done") items = ev.items;
+      if (ev.type === "batch") {
+        scraped += ev.items.length;
+        for (const it of ev.items) bySub[it.subreddit] = (bySub[it.subreddit] || 0) + 1;
+        log(`page ${ev.page} ready: ${ev.items.length} item(s); writing…`);
+        const r = await native.writeItems({
+          vaultPath: settings.vaultPath,
+          folder: settings.folder,
+          syncId,
+          items: ev.items,
+          onBatch: ({ done, total }) => log(`  host batch ack: ${done}/${total}`),
+        });
+        added += r.added;
+        updated += r.updated;
+        log(`page ${ev.page} written: +${r.added} new, ~${r.updated} updated (total so far: ${scraped} item(s))`);
+        $("bar").style.width = "90%";
+      } else if (ev.type === "done") {
+        $("bar").style.width = "95%";
+      }
     }
-
-    if (!settings.embedImages) items = items.map((it) => ({ ...it, imageUrl: it.postType === "image" ? it.imageUrl : null }));
-    log(`scrape complete: ${items.length} item(s). writing…`);
-    $("bar").style.width = "90%";
-
-    const report = await native.writeItems({
-      vaultPath: settings.vaultPath,
-      folder: settings.folder,
-      syncId,
-      items,
-      onBatch: ({ done, total, added, updated }) => {
-        log(`written batch: ${done}/${total} items (added ${added}, updated ${updated})`);
-        $("bar").style.width = `${90 + Math.round((done / Math.max(1, total)) * 10)}%`;
-      },
-    });
     $("bar").style.width = "100%";
 
-    const bySub = {};
-    for (const it of items) bySub[it.subreddit] = (bySub[it.subreddit] || 0) + 1;
     const subs = Object.entries(bySub).sort((a, b) => b[1] - a[1]);
     const lines = [
-      `Done. ${items.length} item(s): +${report.added} new, ~${report.updated} updated.`,
+      `Done. ${scraped} item(s): +${added} new, ~${updated} updated.`,
       subs.length ? `Per subreddit: ${subs.map(([s, n]) => `r/${s}: ${n}`).join(" · ")}` : "Nothing new to write.",
     ];
     setStatus($("final"), "ok", lines.join("\n"));
     log(lines.join(" | "));
   } catch (err) {
-    const cls = err instanceof LoginWallError || err instanceof UserMismatchError ? "err"
-      : err instanceof HttpError ? "err" : "err";
+    const cls = "err";
+    const writtenNote = scraped
+      ? ` ${scraped} item(s) already written this sync (+${added} new, ~${updated} updated).`
+      : " Nothing written yet.";
     const msg = err?.name === "Error" && /cancel/i.test(err.message || "")
-      ? `Cancelled after ${items.length} scraped item(s) (nothing written).`
-      : `${err.message}`;
+      ? `Cancelled.${writtenNote}`
+      : `${err.message}.${writtenNote}`;
     setStatus($("final"), cls, msg);
     log(`ERROR: ${err.stack || err.message}`);
   } finally {
